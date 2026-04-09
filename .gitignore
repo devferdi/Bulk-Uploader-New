@@ -1,2 +1,5 @@
+.DS_Store
 credentials.txt
-credentials.txt
+__pycache__/
+backend/.env
+backend/*.db

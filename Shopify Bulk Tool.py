@@ -23,6 +23,7 @@ import mimetypes
 from openai import OpenAI
 
 file_lock = threading.Lock()  # 🔒 Prevents simultaneous write conflicts
+DEFAULT_SHOPIFY_API_VERSION = "2026-01"
 
 
 
@@ -242,9 +243,186 @@ def read_credentials(file_path):
     credentials = {}
     with open(file_path, 'r') as file:
         for line in file:
-            key, value = line.strip().split('=')
-            credentials[key] = value
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            credentials[key.strip()] = value.strip()
     return credentials
+
+
+def normalize_shop_domain(shop_name):
+    shop_name = (shop_name or "").strip().lower()
+    if not shop_name:
+        raise RuntimeError("Missing 'store_name' in credentials.txt.")
+
+    if "://" in shop_name:
+        parsed = urllib.parse.urlparse(shop_name)
+        shop_name = parsed.netloc or parsed.path
+
+    shop_name = shop_name.split("/", 1)[0].strip(".")
+    if not shop_name:
+        raise RuntimeError("Invalid 'store_name' in credentials.txt.")
+
+    if shop_name.endswith(".myshopify.com"):
+        shop_domain = shop_name
+    else:
+        shop_domain = f"{shop_name}.myshopify.com"
+
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-.")
+    if any(char not in allowed for char in shop_domain):
+        raise RuntimeError("Invalid Shopify store domain in credentials.txt.")
+
+    if not shop_domain.endswith(".myshopify.com"):
+        raise RuntimeError("Shopify store must end with '.myshopify.com'.")
+
+    return shop_domain
+
+
+def get_shop_name(shop_name):
+    shop_domain = normalize_shop_domain(shop_name)
+    return shop_domain[: -len(".myshopify.com")]
+
+
+def get_shopify_api_version(credentials):
+    return (
+        credentials.get("shopify_api_version")
+        or credentials.get("api_version")
+        or DEFAULT_SHOPIFY_API_VERSION
+    )
+
+
+def build_shopify_admin_urls(shop_domain, api_version):
+    base_url = f"https://{shop_domain}/admin/api/{api_version}"
+    return base_url, f"{base_url}/graphql.json"
+
+
+def fetch_access_token_from_backend(shop_domain, credentials):
+    backend_base_url = (
+        credentials.get("oauth_backend_url")
+        or credentials.get("shopify_oauth_backend_url")
+        or ""
+    ).rstrip("/")
+    agency_api_key = (
+        credentials.get("agency_api_key")
+        or credentials.get("backend_api_key")
+        or ""
+    ).strip()
+
+    if not backend_base_url or not agency_api_key:
+        return None
+
+    response = requests.get(
+        f"{backend_base_url}/api/shops/{urllib.parse.quote(shop_domain, safe='')}/token",
+        headers={"Authorization": f"Bearer {agency_api_key}"},
+        timeout=20,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    access_token = payload.get("access_token")
+    if not access_token:
+        raise RuntimeError(
+            f"OAuth backend did not return an access token for store '{shop_domain}'."
+        )
+    return access_token
+
+
+def fetch_access_token_from_dev_dashboard(shop_domain, credentials):
+    client_id = (
+        credentials.get("shopify_client_id")
+        or credentials.get("client_id")
+        or ""
+    ).strip()
+    client_secret = (
+        credentials.get("shopify_client_secret")
+        or credentials.get("client_secret")
+        or ""
+    ).strip()
+
+    if not client_id or not client_secret:
+        return None
+
+    try:
+        response = requests.post(
+            f"https://{shop_domain}/admin/oauth/access_token",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response = exc.response
+        response_text = response.text[:500] if response is not None else str(exc)
+        if response is not None and response.status_code == 400:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            if payload.get("error") == "shop_not_permitted":
+                raise RuntimeError(
+                    "This store does not allow client-credentials for this app. "
+                    "Configure 'oauth_backend_url=' and 'agency_api_key=' in "
+                    "credentials.txt and use the OAuth backend flow instead."
+                ) from exc
+        raise RuntimeError(
+            "Shopify rejected the Dev Dashboard token request. Confirm the app is "
+            "installed on the store, that a version with the required scopes has "
+            f"been released, and that the client ID/secret are correct. Details: {response_text}"
+        ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not reach Shopify to request a token for '{shop_domain}': {exc}"
+        ) from exc
+
+    payload = response.json()
+    access_token = payload.get("access_token")
+    if not access_token:
+        raise RuntimeError(
+            f"Shopify did not return an access token for '{shop_domain}'."
+        )
+    return access_token
+
+
+def load_shopify_context(credentials_path):
+    credentials = read_credentials(credentials_path)
+
+    shop_domain = normalize_shop_domain(credentials.get("store_name", ""))
+    shop_name = get_shop_name(shop_domain)
+
+    access_token = credentials.get("access_token", "").strip()
+    if not access_token:
+        access_token = fetch_access_token_from_backend(shop_domain, credentials)
+    if not access_token:
+        access_token = fetch_access_token_from_dev_dashboard(shop_domain, credentials)
+
+    if not access_token:
+        raise RuntimeError(
+            "No Shopify access token found. Configure one of these in "
+            "credentials.txt: 'access_token=', or 'oauth_backend_url=' with "
+            "'agency_api_key=', or 'shopify_client_id=' with "
+            "'shopify_client_secret='."
+        )
+
+    api_version = get_shopify_api_version(credentials)
+    base_url, graphql_url = build_shopify_admin_urls(shop_domain, api_version)
+
+    return {
+        "credentials": credentials,
+        "shop_domain": shop_domain,
+        "shop_name": shop_name,
+        "access_token": access_token,
+        "api_version": api_version,
+        "base_url": base_url,
+        "graphql_url": graphql_url,
+    }
 
 
 
@@ -258,13 +436,13 @@ def run_downloader_logic():
     # Build the full path to 'credentials.txt'
     credentials_path = os.path.join(script_dir, 'credentials.txt')
 
-    # Load credentials from 'credentials.txt'
-    credentials = read_credentials(credentials_path)
-    SHOP_NAME = credentials['store_name']
-    ACCESS_TOKEN = credentials['access_token']
+    shopify_context = load_shopify_context(credentials_path)
+    SHOP_NAME = shopify_context["shop_name"]
+    ACCESS_TOKEN = shopify_context["access_token"]
 
     # Shopify API URL
-    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07"
+    BASE_URL = shopify_context["base_url"]
+    GRAPHQL_URL = shopify_context["graphql_url"]
 
     # Headers for API authentication
     headers = {
@@ -367,8 +545,7 @@ def run_downloader_logic():
             }}
             """
         }
-        url = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
-        response = requests.post(url, json=query, headers=headers)
+        response = requests.post(GRAPHQL_URL, json=query, headers=headers)
         if response.status_code == 200:
             data = response.json()
             return data['data']['media']['image']['originalSrc']
@@ -693,14 +870,13 @@ def run_uploader_logic():
     # Build the full path to 'credentials.txt'
     credentials_path = os.path.join(script_dir, 'credentials.txt')
 
-    # Load credentials from 'credentials.txt'
-    credentials = read_credentials(credentials_path)
-    SHOP_NAME = credentials['store_name']
-    ACCESS_TOKEN = credentials['access_token']
+    shopify_context = load_shopify_context(credentials_path)
+    SHOP_NAME = shopify_context["shop_name"]
+    ACCESS_TOKEN = shopify_context["access_token"]
 
     # Shopify API URLs
-    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07"
-    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
+    BASE_URL = shopify_context["base_url"]
+    GRAPHQL_URL = shopify_context["graphql_url"]
 
     # Headers for API authentication
     headers = {
@@ -3365,13 +3541,12 @@ def collection_run_downloader_logic():
     # Build the full path to 'credentials.txt'
     credentials_path = os.path.join(script_dir, 'credentials.txt')
 
-    # Load credentials
-    credentials = read_credentials(credentials_path)
-    SHOP_NAME = credentials['store_name']
-    ACCESS_TOKEN = credentials['access_token']
+    shopify_context = load_shopify_context(credentials_path)
+    SHOP_NAME = shopify_context["shop_name"]
+    ACCESS_TOKEN = shopify_context["access_token"]
 
     # Shopify API URL
-    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07"
+    BASE_URL = shopify_context["base_url"]
     HEADERS = {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": ACCESS_TOKEN
@@ -3528,13 +3703,13 @@ def collection_run_uploader_logic():
 
     # Load credentials
     credentials_path = os.path.join(script_dir, 'credentials.txt')
-    credentials = read_credentials(credentials_path)
-    SHOP_NAME = credentials['store_name']
-    ACCESS_TOKEN = credentials['access_token']
+    shopify_context = load_shopify_context(credentials_path)
+    SHOP_NAME = shopify_context["shop_name"]
+    ACCESS_TOKEN = shopify_context["access_token"]
 
     # Shopify API URLs
-    BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07"
-    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
+    BASE_URL = shopify_context["base_url"]
+    GRAPHQL_URL = shopify_context["graphql_url"]
 
     headers = {
         "Content-Type": "application/json",
@@ -4244,11 +4419,11 @@ def download_shopify_files_alt_texts():
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    credentials = read_credentials(os.path.join(script_dir, 'credentials.txt'))
-    SHOP_NAME = credentials['store_name']
-    ACCESS_TOKEN = credentials['access_token']
+    shopify_context = load_shopify_context(os.path.join(script_dir, 'credentials.txt'))
+    SHOP_NAME = shopify_context["shop_name"]
+    ACCESS_TOKEN = shopify_context["access_token"]
 
-    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
+    GRAPHQL_URL = shopify_context["graphql_url"]
     headers = {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": ACCESS_TOKEN
@@ -4332,11 +4507,11 @@ def upload_shopify_files_alt_texts():
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    credentials = read_credentials(os.path.join(script_dir, 'credentials.txt'))
-    SHOP_NAME = credentials['store_name']
-    ACCESS_TOKEN = credentials['access_token']
+    shopify_context = load_shopify_context(os.path.join(script_dir, 'credentials.txt'))
+    SHOP_NAME = shopify_context["shop_name"]
+    ACCESS_TOKEN = shopify_context["access_token"]
 
-    GRAPHQL_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/2023-07/graphql.json"
+    GRAPHQL_URL = shopify_context["graphql_url"]
     headers = {
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": ACCESS_TOKEN
@@ -4524,6 +4699,10 @@ def generate_seo_alt_texts():
         print(f"❌ Final save failed after 3 attempts. Temp file saved at: {temp_file}")
 
 def beautify_store_name(store_name):
+    try:
+        store_name = get_shop_name(store_name)
+    except RuntimeError:
+        store_name = (store_name or "").strip()
     # Replace hyphens and underscores with spaces
     name = store_name.replace('-', ' ').replace('_', ' ')
     # Remove extra spaces (if any)
