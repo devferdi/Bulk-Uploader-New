@@ -19,6 +19,8 @@ Recommended starting scopes for this repo:
 - `read_locations`
 - `read_files`
 - `write_files`
+- `read_metaobjects`
+- `read_metaobject_definitions`
 
 Add collection or metafield scopes if testing shows they are needed for your store workflows.
 

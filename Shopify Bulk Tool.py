@@ -20,6 +20,7 @@ import re
 import numbers
 import base64
 import mimetypes
+import traceback
 from openai import OpenAI
 
 file_lock = threading.Lock()  # 🔒 Prevents simultaneous write conflicts
@@ -150,6 +151,14 @@ def format_metafield_text_value(value):
         return formatted if formatted else "0"
 
     return str(value)
+
+
+def set_dataframe_cell(df, row_index, column, value):
+    try:
+        df.at[row_index, column] = value
+    except (TypeError, ValueError, pd.errors.LossySetitemError):
+        df[column] = df[column].astype(object)
+        df.at[row_index, column] = value
 
 # Function to convert HTML to Shopify JSON
 def html_to_shopify_json(html_input):
@@ -297,6 +306,77 @@ def build_shopify_admin_urls(shop_domain, api_version):
     return base_url, f"{base_url}/graphql.json"
 
 
+def fetch_granted_access_scopes(shop_domain, access_token):
+    if not shop_domain or not access_token:
+        return None
+
+    try:
+        response = requests.get(
+            f"https://{shop_domain}/admin/oauth/access_scopes.json",
+            headers={"X-Shopify-Access-Token": access_token},
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"⚠️ Could not fetch granted Shopify access scopes: {exc}")
+        return None
+
+    payload = response.json()
+    access_scopes = payload.get("access_scopes", [])
+    return [scope.get("handle") for scope in access_scopes if scope.get("handle")]
+
+
+def log_shopify_access_scope_diagnostics(shopify_context, required_scopes=None):
+    auth_method = shopify_context.get("auth_method") or "unknown"
+    auth_errors = shopify_context.get("auth_errors") or []
+    shop_domain = shopify_context.get("shop_domain") or "(unknown store)"
+    granted_access_scopes = shopify_context.get("granted_access_scopes")
+
+    print(f"Shopify auth method: {auth_method}")
+
+    if auth_errors:
+        print("⚠️ Other configured Shopify auth methods failed before fallback:")
+        for auth_error in auth_errors:
+            print(f"   - {auth_error}")
+
+    if granted_access_scopes is None:
+        print(f"⚠️ Could not verify granted Shopify scopes for {shop_domain}.")
+        return
+
+    unique_scopes = sorted({scope for scope in granted_access_scopes if scope})
+    print(f"Granted Shopify scopes ({len(unique_scopes)}): {', '.join(unique_scopes)}")
+
+    required_scopes = [scope for scope in (required_scopes or []) if scope]
+    if not required_scopes:
+        return
+
+    missing_scopes = [scope for scope in required_scopes if scope not in unique_scopes]
+    if not missing_scopes:
+        print("✅ Current token includes the scopes needed for metaobject title resolution.")
+        return
+
+    print(
+        "❌ Current token is missing required Shopify scopes: "
+        + ", ".join(missing_scopes)
+    )
+
+    if auth_method == "Dev Dashboard client credentials":
+        print(
+            "➡️ Release a new app version with the updated scopes, update or reinstall "
+            "the app on the store, then restart this tool so it gets a fresh token."
+        )
+    elif auth_method == "OAuth backend":
+        print(
+            "➡️ Reinstall or re-authorize the Shopify app for this store so the backend "
+            "stores a fresh token with the new scopes."
+        )
+    elif auth_method == "credentials.txt access_token":
+        print(
+            "➡️ Replace the manual access token in credentials.txt with one created "
+            "after the new scopes were granted."
+        )
+
+
 def fetch_access_token_from_backend(shop_domain, credentials):
     backend_base_url = (
         credentials.get("oauth_backend_url")
@@ -312,12 +392,44 @@ def fetch_access_token_from_backend(shop_domain, credentials):
     if not backend_base_url or not agency_api_key:
         return None
 
-    response = requests.get(
-        f"{backend_base_url}/api/shops/{urllib.parse.quote(shop_domain, safe='')}/token",
-        headers={"Authorization": f"Bearer {agency_api_key}"},
-        timeout=20,
+    token_url = (
+        f"{backend_base_url}/api/shops/"
+        f"{urllib.parse.quote(shop_domain, safe='')}/token"
     )
-    response.raise_for_status()
+
+    try:
+        response = requests.get(
+            token_url,
+            headers={"Authorization": f"Bearer {agency_api_key}"},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not reach the OAuth backend at '{backend_base_url}': {exc}"
+        ) from exc
+
+    if response.status_code == 404:
+        raise RuntimeError(
+            "The OAuth backend returned 404 for the shop token endpoint. "
+            f"Checked: {token_url}. This usually means either the store is not "
+            "connected in the backend yet, or the deployed backend does not have "
+            "the `/api/shops/{shop}/token` route."
+        )
+
+    if response.status_code in (401, 403):
+        raise RuntimeError(
+            "The OAuth backend rejected the agency API key. Check "
+            "`agency_api_key` in `credentials.txt` and the backend configuration."
+        )
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response_text = response.text[:500] if response is not None else str(exc)
+        raise RuntimeError(
+            f"OAuth backend token request failed with HTTP {response.status_code}. "
+            f"Details: {response_text}"
+        ) from exc
 
     payload = response.json()
     access_token = payload.get("access_token")
@@ -397,28 +509,47 @@ def load_shopify_context(credentials_path):
     shop_domain = normalize_shop_domain(credentials.get("store_name", ""))
     shop_name = get_shop_name(shop_domain)
 
+    auth_errors = []
+    auth_method = None
     access_token = credentials.get("access_token", "").strip()
+    if access_token:
+        auth_method = "credentials.txt access_token"
     if not access_token:
-        access_token = fetch_access_token_from_backend(shop_domain, credentials)
+        try:
+            access_token = fetch_access_token_from_backend(shop_domain, credentials)
+            auth_method = "OAuth backend"
+        except RuntimeError as exc:
+            auth_errors.append(str(exc))
     if not access_token:
-        access_token = fetch_access_token_from_dev_dashboard(shop_domain, credentials)
+        try:
+            access_token = fetch_access_token_from_dev_dashboard(shop_domain, credentials)
+            auth_method = "Dev Dashboard client credentials"
+        except RuntimeError as exc:
+            auth_errors.append(str(exc))
 
     if not access_token:
+        error_details = ""
+        if auth_errors:
+            error_details = "\n\nTried these auth methods:\n- " + "\n- ".join(auth_errors)
         raise RuntimeError(
             "No Shopify access token found. Configure one of these in "
             "credentials.txt: 'access_token=', or 'oauth_backend_url=' with "
             "'agency_api_key=', or 'shopify_client_id=' with "
-            "'shopify_client_secret='."
+            f"'shopify_client_secret='.{error_details}"
         )
 
     api_version = get_shopify_api_version(credentials)
     base_url, graphql_url = build_shopify_admin_urls(shop_domain, api_version)
+    granted_access_scopes = fetch_granted_access_scopes(shop_domain, access_token)
 
     return {
         "credentials": credentials,
         "shop_domain": shop_domain,
         "shop_name": shop_name,
         "access_token": access_token,
+        "auth_method": auth_method or "unknown",
+        "auth_errors": auth_errors,
+        "granted_access_scopes": granted_access_scopes,
         "api_version": api_version,
         "base_url": base_url,
         "graphql_url": graphql_url,
@@ -439,6 +570,8 @@ def run_downloader_logic():
     shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
+    granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
+    log_shopify_access_scope_diagnostics(shopify_context)
 
     # Shopify API URL
     BASE_URL = shopify_context["base_url"]
@@ -449,6 +582,139 @@ def run_downloader_logic():
         "Content-Type": "application/json",
         "X-Shopify-Access-Token": ACCESS_TOKEN
     }
+
+    metaobject_label_cache = {}
+    warned_missing_metaobject_scope = False
+
+    def parse_metaobject_reference_values(value):
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        try:
+            if pd.isna(value):
+                return []
+        except TypeError:
+            pass
+
+        raw_value = str(value).strip()
+        if not raw_value:
+            return []
+
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+
+        return [raw_value]
+
+    def get_metaobject_display_label(metaobject_gid):
+        nonlocal warned_missing_metaobject_scope
+
+        if not metaobject_gid:
+            return metaobject_gid
+
+        if metaobject_gid in metaobject_label_cache:
+            return metaobject_label_cache[metaobject_gid]
+
+        if (
+            granted_access_scopes
+            and "read_metaobjects" not in granted_access_scopes
+        ):
+            if not warned_missing_metaobject_scope:
+                print(
+                    "⚠️ Current Shopify token does not include `read_metaobjects`, "
+                    "so metaobject references will be exported as raw GIDs."
+                )
+                warned_missing_metaobject_scope = True
+            metaobject_label_cache[metaobject_gid] = metaobject_gid
+            return metaobject_gid
+
+        query = """
+        query MetaobjectNode($id: ID!) {
+          node(id: $id) {
+            ... on Metaobject {
+              id
+              displayName
+              handle
+              fields {
+                key
+                value
+              }
+            }
+          }
+        }
+        """
+
+        try:
+            response = requests.post(
+                GRAPHQL_URL,
+                headers=headers,
+                json={"query": query, "variables": {"id": metaobject_gid}},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            print(f"⚠️ Failed to resolve metaobject {metaobject_gid}: {exc}")
+            metaobject_label_cache[metaobject_gid] = metaobject_gid
+            return metaobject_gid
+        except ValueError as exc:
+            print(f"⚠️ Failed to parse metaobject lookup response for {metaobject_gid}: {exc}")
+            metaobject_label_cache[metaobject_gid] = metaobject_gid
+            return metaobject_gid
+
+        errors = payload.get("errors") or []
+        if errors:
+            print(f"⚠️ GraphQL metaobject lookup errors for {metaobject_gid}: {errors}")
+            metaobject_label_cache[metaobject_gid] = metaobject_gid
+            return metaobject_gid
+
+        node = ((payload.get("data") or {}).get("node") or {})
+        label_candidates = [
+            node.get("displayName"),
+            next(
+                (
+                    field.get("value")
+                    for field in (node.get("fields") or [])
+                    if (field.get("key") or "").strip().lower() in {"title", "name", "label"}
+                    and field.get("value")
+                ),
+                None,
+            ),
+            node.get("handle"),
+        ]
+
+        resolved_label = next((candidate for candidate in label_candidates if candidate), metaobject_gid)
+        metaobject_label_cache[metaobject_gid] = resolved_label
+        return resolved_label
+
+    def resolve_downloaded_metafield_value(metafield):
+        field_type = (metafield.get("type") or "").strip().lower()
+        raw_value = metafield.get("value")
+
+        if not raw_value:
+            return raw_value
+
+        if field_type == "metaobject_reference":
+            return get_metaobject_display_label(str(raw_value).strip())
+
+        if field_type == "list.metaobject_reference":
+            reference_values = parse_metaobject_reference_values(raw_value)
+            if not reference_values:
+                return raw_value
+            resolved_values = [
+                get_metaobject_display_label(reference_value)
+                for reference_value in reference_values
+            ]
+            resolved_values = [value for value in resolved_values if value]
+            if not resolved_values:
+                return raw_value
+            return ", ".join(resolved_values)
+
+        return raw_value
 
     # The rest of your downloader logic goes here...
 
@@ -734,7 +1000,7 @@ def run_downloader_logic():
             metafields = product_id_to_metafields.get(product['id'], [])
             for metafield in metafields:
                 key = metafield['key']
-                value = metafield['value']
+                value = resolve_downloaded_metafield_value(metafield)
                 namespace = metafield['namespace']
                 field_type = metafield.get('type', 'unknown')
                 column_name = f"Metafield: {namespace}.{key} [{field_type}]"
@@ -745,7 +1011,7 @@ def run_downloader_logic():
             first_variant_metafields = variant_id_to_metafields.get(first_variant.get('id'), [])
             for metafield in first_variant_metafields:
                 key = metafield['key']
-                value = metafield['value']
+                value = resolve_downloaded_metafield_value(metafield)
                 namespace = metafield['namespace']
                 field_type = metafield.get('type', 'unknown')
                 column_name = f"Variant Metafield: {namespace}.{key} [{field_type}]"
@@ -807,7 +1073,7 @@ def run_downloader_logic():
                 variant_metafields = variant_id_to_metafields.get(variant.get('id'), [])
                 for metafield in variant_metafields:
                     key = metafield['key']
-                    value = metafield['value']
+                    value = resolve_downloaded_metafield_value(metafield)
                     namespace = metafield['namespace']
                     field_type = metafield.get('type', 'unknown')
                     column_name = f"Variant Metafield: {namespace}.{key} [{field_type}]"
@@ -873,6 +1139,11 @@ def run_uploader_logic():
     shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=["read_metaobjects", "read_metaobject_definitions"],
+    )
+    granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
 
     # Shopify API URLs
     BASE_URL = shopify_context["base_url"]
@@ -909,7 +1180,7 @@ def run_uploader_logic():
         }
         """
         data = _graphql_post(query, {"id": media_gid}, purpose="Media status")
-        node = (data or {}).get("data", {}).get("node", {}) or {}
+        node = (((data or {}).get("data") or {}).get("node") or {})
         return node.get("status")
 
     def _wait_until_media_ready(media_gid, timeout_s=240, interval_s=3):
@@ -949,6 +1220,511 @@ def run_uploader_logic():
             print(f"❌ GraphQL {purpose} errors: {data['errors']}")
         return data
 
+    metaobject_definition_cache = {}
+    metaobject_lookup_cache = {}
+    metaobject_known_reference_cache = {}
+    owner_summary_cache = {}
+
+    def normalize_metaobject_lookup_value(value):
+        if value is None:
+            return ""
+        return re.sub(r"\s+", " ", str(value)).strip().casefold()
+
+    def parse_metaobject_reference_values(value):
+        if value is None:
+            return []
+
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        try:
+            if pd.isna(value):
+                return []
+        except TypeError:
+            pass
+
+        raw_value = str(value).strip()
+        if not raw_value:
+            return []
+
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+
+        return [item.strip() for item in re.split(r"[\n,;]+", raw_value) if item.strip()]
+
+    def get_metafield_metaobject_definition(owner_type, namespace, key):
+        cache_key = (owner_type, namespace, key)
+        if cache_key in metaobject_definition_cache:
+            return metaobject_definition_cache[cache_key]
+
+        query = """
+        query MetafieldDefinitionLookup(
+          $ownerType: MetafieldOwnerType!,
+          $namespace: String!,
+          $key: String!
+        ) {
+          metafieldDefinitions(
+            first: 1,
+            ownerType: $ownerType,
+            namespace: $namespace,
+            key: $key
+          ) {
+            nodes {
+              id
+              name
+              validations {
+                name
+                value
+              }
+            }
+          }
+        }
+        """
+        data = _graphql_post(
+            query,
+            {
+                "ownerType": owner_type,
+                "namespace": namespace,
+                "key": key,
+            },
+            purpose=f"Metafield definition lookup for {owner_type} {namespace}.{key}",
+        )
+        definition_nodes = (((data or {}).get("data") or {}).get("metafieldDefinitions") or {}).get("nodes") or []
+        if not definition_nodes:
+            print(
+                f"⚠️ Could not find a metafield definition for {owner_type} {namespace}.{key}; "
+                "metaobject titles cannot be resolved."
+            )
+            metaobject_definition_cache[cache_key] = None
+            return None
+
+        definition_node = definition_nodes[0]
+        definition_gid = None
+        metaobject_type = None
+
+        for validation in definition_node.get("validations") or []:
+            validation_name = (validation.get("name") or "").strip().lower()
+            if "metaobject_definition" not in validation_name:
+                continue
+
+            for candidate in parse_metaobject_reference_values(validation.get("value")):
+                if candidate.startswith("gid://shopify/MetaobjectDefinition/"):
+                    definition_gid = candidate
+                    break
+                if candidate and not metaobject_type:
+                    metaobject_type = candidate
+
+            if definition_gid:
+                break
+
+        definition_name = definition_node.get("name")
+        if definition_gid:
+            definition_query = """
+            query MetaobjectDefinitionLookup($id: ID!) {
+              node(id: $id) {
+                ... on MetaobjectDefinition {
+                  id
+                  name
+                  type
+                }
+              }
+            }
+            """
+            definition_data = _graphql_post(
+                definition_query,
+                {"id": definition_gid},
+                purpose=f"Metaobject definition details for {namespace}.{key}",
+            )
+            definition_details = (((definition_data or {}).get("data") or {}).get("node") or {})
+            definition_name = definition_details.get("name") or definition_name
+            metaobject_type = definition_details.get("type") or metaobject_type
+
+        if not metaobject_type:
+            if granted_access_scopes and "read_metaobject_definitions" not in granted_access_scopes:
+                print(
+                    "⚠️ The current Shopify token does not include "
+                    "`read_metaobject_definitions`, so metaobject titles cannot be "
+                    "resolved by definition lookup yet."
+                )
+            print(
+                f"⚠️ Found metafield definition for {namespace}.{key}, but could not determine "
+                "which metaobject type it references."
+            )
+            metaobject_definition_cache[cache_key] = None
+            return None
+
+        definition_info = {
+            "definition_id": definition_gid,
+            "definition_name": definition_name,
+            "metaobject_type": metaobject_type,
+        }
+        metaobject_definition_cache[cache_key] = definition_info
+        return definition_info
+
+    def add_metaobject_lookup_candidate(lookup, raw_value, entry):
+        normalized_value = normalize_metaobject_lookup_value(raw_value)
+        if not normalized_value:
+            return
+
+        matches = lookup.setdefault(normalized_value, [])
+        if all(existing["id"] != entry["id"] for existing in matches):
+            matches.append(entry)
+
+    def get_metaobject_lookup(metaobject_type):
+        if metaobject_type in metaobject_lookup_cache:
+            return metaobject_lookup_cache[metaobject_type]
+
+        query = """
+        query MetaobjectsByType($type: String!, $after: String) {
+          metaobjects(type: $type, first: 250, after: $after) {
+            nodes {
+              id
+              displayName
+              handle
+              fields {
+                key
+                value
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        lookup = {}
+        has_next_page = True
+        cursor = None
+
+        while has_next_page:
+            data = _graphql_post(
+                query,
+                {"type": metaobject_type, "after": cursor},
+                purpose=f"Metaobjects lookup for type {metaobject_type}",
+            )
+            connection = (((data or {}).get("data") or {}).get("metaobjects") or {})
+            nodes = connection.get("nodes") or []
+
+            for node in nodes:
+                metaobject_id = node.get("id")
+                if not metaobject_id:
+                    continue
+
+                entry = {
+                    "id": metaobject_id,
+                    "display_name": node.get("displayName") or "",
+                    "handle": node.get("handle") or "",
+                }
+                add_metaobject_lookup_candidate(lookup, entry["display_name"], entry)
+                add_metaobject_lookup_candidate(lookup, entry["handle"], entry)
+
+                for field in node.get("fields") or []:
+                    field_key = (field.get("key") or "").strip().lower()
+                    field_value = field.get("value")
+                    if field_key in {"title", "name", "label"} and field_value:
+                        add_metaobject_lookup_candidate(lookup, field_value, entry)
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        metaobject_lookup_cache[metaobject_type] = lookup
+        return lookup
+
+    def get_owner_summaries_for_metaobject_debug(owner_type):
+        if owner_type in owner_summary_cache:
+            return owner_summary_cache[owner_type]
+
+        owner_summaries = []
+        for product in get_all_products_forsku() or []:
+            product_id = product.get("id")
+            product_title = product.get("title") or ""
+            product_handle = product.get("handle") or ""
+
+            if owner_type == "PRODUCT":
+                if product_id:
+                    owner_summaries.append(
+                        {
+                            "owner_id": str(product_id),
+                            "owner_label": product_handle or product_title or str(product_id),
+                            "product_title": product_title,
+                            "product_handle": product_handle,
+                        }
+                    )
+                continue
+
+            if owner_type == "PRODUCTVARIANT":
+                for variant in product.get("variants", []) or []:
+                    variant_id = variant.get("id")
+                    if not variant_id:
+                        continue
+                    variant_sku = variant.get("sku") or ""
+                    owner_summaries.append(
+                        {
+                            "owner_id": str(variant_id),
+                            "owner_label": variant_sku or f"{product_handle}:{variant_id}",
+                            "product_title": product_title,
+                            "product_handle": product_handle,
+                            "variant_sku": variant_sku,
+                        }
+                    )
+
+        owner_summary_cache[owner_type] = owner_summaries
+        return owner_summaries
+
+    def fetch_metaobject_node_by_gid(metaobject_gid):
+        query = """
+        query MetaobjectNode($id: ID!) {
+          node(id: $id) {
+            ... on Metaobject {
+              id
+              displayName
+              handle
+              type
+              fields {
+                key
+                value
+              }
+            }
+          }
+        }
+        """
+        data = _graphql_post(
+            query,
+            {"id": metaobject_gid},
+            purpose=f"Metaobject lookup for {metaobject_gid}",
+        )
+        return (((data or {}).get("data") or {}).get("node") or {})
+
+    def build_known_metaobject_reference_cache(owner_type, namespace, key):
+        cache_key = (owner_type, namespace, key)
+        if cache_key in metaobject_known_reference_cache:
+            return metaobject_known_reference_cache[cache_key]
+
+        endpoint = "products" if owner_type == "PRODUCT" else "variants"
+        owner_summaries = get_owner_summaries_for_metaobject_debug(owner_type)
+        metaobject_references = {}
+
+        print(
+            f"🔎 Building known metaobject reference list for {owner_type} {namespace}.{key} "
+            f"from {len(owner_summaries)} owners..."
+        )
+
+        for owner_summary in owner_summaries:
+            owner_id = owner_summary["owner_id"]
+            try:
+                response = requests.get(
+                    f"{BASE_URL}/{endpoint}/{owner_id}/metafields.json",
+                    headers=headers,
+                    params={"limit": 250},
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                print(f"⚠️ Failed to fetch metafields for {endpoint[:-1]} {owner_id}: {exc}")
+                continue
+
+            if response.status_code != 200:
+                print(
+                    f"⚠️ Failed to fetch metafields for {endpoint[:-1]} {owner_id}: "
+                    f"{response.status_code}, {response.text[:300]}"
+                )
+                continue
+
+            for metafield in response.json().get("metafields", []) or []:
+                if metafield.get("namespace") != namespace or metafield.get("key") != key:
+                    continue
+                for candidate_gid in parse_metaobject_reference_values(metafield.get("value")):
+                    if not candidate_gid.startswith("gid://shopify/Metaobject/"):
+                        continue
+                    references = metaobject_references.setdefault(candidate_gid, [])
+                    owner_label = owner_summary.get("owner_label") or owner_id
+                    if owner_label not in references:
+                        references.append(owner_label)
+
+        lookup = {}
+        debug_rows = []
+
+        for metaobject_gid, references in metaobject_references.items():
+            node = fetch_metaobject_node_by_gid(metaobject_gid)
+            display_name = node.get("displayName") or ""
+            handle_value = node.get("handle") or ""
+            metaobject_type = node.get("type") or ""
+
+            entry = {
+                "id": metaobject_gid,
+                "display_name": display_name,
+                "handle": handle_value,
+                "type": metaobject_type,
+                "references": references,
+            }
+
+            labels = []
+            for label_candidate in [display_name, handle_value]:
+                if label_candidate and label_candidate not in labels:
+                    labels.append(label_candidate)
+
+            for field in node.get("fields") or []:
+                field_key = (field.get("key") or "").strip().lower()
+                field_value = (field.get("value") or "").strip()
+                if field_key in {"title", "name", "label"} and field_value and field_value not in labels:
+                    labels.append(field_value)
+
+            if not labels:
+                labels.append(metaobject_gid)
+
+            for label in labels:
+                add_metaobject_lookup_candidate(lookup, label, entry)
+
+            debug_rows.append(
+                {
+                    "Metaobject ID": metaobject_gid,
+                    "Display Name": display_name,
+                    "Handle": handle_value,
+                    "Type": metaobject_type,
+                    "Known Labels": " | ".join(labels),
+                    "Referenced By": " ; ".join(references),
+                }
+            )
+
+        export_path = None
+        if debug_rows:
+            safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", f"{namespace}_{key}")
+            export_path = os.path.join(
+                script_dir,
+                f"metaobject_debug_{safe_name}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx",
+            )
+            try:
+                pd.DataFrame(debug_rows).to_excel(export_path, index=False)
+                print(
+                    f"📝 Wrote known metaobject reference list for {namespace}.{key} to "
+                    f"{export_path}"
+                )
+            except Exception as exc:
+                print(f"⚠️ Failed to write metaobject debug file for {namespace}.{key}: {exc}")
+                export_path = None
+        else:
+            print(f"⚠️ No existing metaobject references found for {namespace}.{key} in the store.")
+
+        cache_value = {
+            "lookup": lookup,
+            "debug_rows": debug_rows,
+            "export_path": export_path,
+        }
+        metaobject_known_reference_cache[cache_key] = cache_value
+        return cache_value
+
+    def resolve_metaobject_from_known_references(owner_type, namespace, key, raw_value):
+        known_reference_cache = build_known_metaobject_reference_cache(owner_type, namespace, key)
+        lookup = known_reference_cache.get("lookup", {})
+        matches = lookup.get(normalize_metaobject_lookup_value(raw_value), [])
+
+        if len(matches) == 1:
+            resolved_gid = matches[0]["id"]
+            print(
+                f"🔗 Resolved metaobject '{raw_value}' from known {namespace}.{key} "
+                f"references: {resolved_gid}"
+            )
+            return resolved_gid
+
+        debug_path = known_reference_cache.get("export_path")
+        if len(matches) > 1:
+            options = ", ".join(
+                match.get("display_name") or match.get("handle") or match.get("id")
+                for match in matches
+            )
+            print(
+                f"❌ Metaobject value '{raw_value}' is ambiguous in known {namespace}.{key} "
+                f"references. Matches: {options}"
+            )
+            if debug_path:
+                print(f"📝 Review the debug list here: {debug_path}")
+            return None
+
+        if debug_path:
+            print(
+                f"⚠️ '{raw_value}' was not found in the known {namespace}.{key} reference list. "
+                f"Review the debug list here: {debug_path}"
+            )
+        return None
+
+    def resolve_metaobject_reference_gid(owner_type, namespace, key, raw_value):
+        if isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+
+        if not raw_value:
+            return None
+
+        if isinstance(raw_value, str) and raw_value.startswith("gid://shopify/Metaobject/"):
+            return raw_value
+
+        definition_info = get_metafield_metaobject_definition(owner_type, namespace, key)
+        if not definition_info:
+            return resolve_metaobject_from_known_references(owner_type, namespace, key, raw_value)
+
+        lookup = get_metaobject_lookup(definition_info["metaobject_type"])
+        matches = lookup.get(normalize_metaobject_lookup_value(raw_value), [])
+
+        if len(matches) == 1:
+            resolved_gid = matches[0]["id"]
+            print(
+                f"🔗 Resolved metaobject '{raw_value}' to {resolved_gid} for "
+                f"{namespace}.{key}"
+            )
+            return resolved_gid
+
+        if len(matches) > 1:
+            options = ", ".join(
+                match["display_name"] or match["handle"] or match["id"] for match in matches
+            )
+            print(
+                f"❌ Metaobject value '{raw_value}' is ambiguous for {namespace}.{key}. "
+                f"Matches: {options}"
+            )
+            return resolve_metaobject_from_known_references(owner_type, namespace, key, raw_value)
+
+        print(
+            f"❌ Could not resolve metaobject value '{raw_value}' for {namespace}.{key}. "
+            f"Expected a metaobject of type '{definition_info['metaobject_type']}'."
+        )
+        return resolve_metaobject_from_known_references(owner_type, namespace, key, raw_value)
+
+    def resolve_metaobject_reference_value(owner_type, namespace, key, value):
+        values = parse_metaobject_reference_values(value)
+        if not values:
+            return None
+
+        if len(values) > 1:
+            print(
+                f"❌ Metafield {namespace}.{key} accepts a single metaobject reference, "
+                f"but received {len(values)} values: {values}"
+            )
+            return None
+
+        return resolve_metaobject_reference_gid(owner_type, namespace, key, values[0])
+
+    def resolve_metaobject_reference_list(owner_type, namespace, key, value):
+        resolved_gids = []
+        seen = set()
+
+        for raw_item in parse_metaobject_reference_values(value):
+            resolved_gid = resolve_metaobject_reference_gid(owner_type, namespace, key, raw_item)
+            if not resolved_gid:
+                return None
+            if resolved_gid not in seen:
+                seen.add(resolved_gid)
+                resolved_gids.append(resolved_gid)
+
+        return resolved_gids
+
     def to_gid(resource, numeric_id):
         return f"gid://shopify/{resource}/{numeric_id}"
 
@@ -984,8 +1760,8 @@ def run_uploader_logic():
         if not data:
             return None
 
-        nodes = (data.get("data", {})
-                    .get("product", {})
+        nodes = ((((data or {}).get("data") or {})
+                    .get("product") or {})
                     .get("images", {})
                     .get("nodes", []))
         for node in nodes:
@@ -1027,15 +1803,15 @@ def run_uploader_logic():
             print("❌ No data returned from productCreateMedia.")
             return None
 
-        errs = (data.get("data", {})
-                    .get("productCreateMedia", {})
+        errs = ((((data or {}).get("data") or {})
+                    .get("productCreateMedia") or {})
                     .get("mediaUserErrors", []))
         if errs:
             print(f"❌ productCreateMedia errors: {errs}")
             return None
 
-        media_nodes = (data.get("data", {})
-                           .get("productCreateMedia", {})
+        media_nodes = ((((data or {}).get("data") or {})
+                           .get("productCreateMedia") or {})
                            .get("media", []))
         for node in media_nodes:
             if node.get("__typename") == "MediaImage":
@@ -1074,8 +1850,8 @@ def run_uploader_logic():
         if not data:
             return None
 
-        nodes = (data.get("data", {})
-                    .get("product", {})
+        nodes = ((((data or {}).get("data") or {})
+                    .get("product") or {})
                     .get("media", {})
                     .get("nodes", []))
         for node in nodes:
@@ -1151,8 +1927,8 @@ def run_uploader_logic():
             print(f"❌ No data returned from productVariantAppendMedia for variant {variant_id}")
             return
 
-        user_errors = (data.get("data", {})
-                           .get("productVariantAppendMedia", {})
+        user_errors = ((((data or {}).get("data") or {})
+                           .get("productVariantAppendMedia") or {})
                            .get("userErrors", []))
         if user_errors:
             # Optional: auto-retry once if NON_READY_MEDIA somehow sneaks through
@@ -1165,8 +1941,8 @@ def run_uploader_logic():
                     )
                     return
                 data = _graphql_post(mutation, variables, purpose="productVariantAppendMedia (retry)")
-                user_errors = (data.get("data", {})
-                                   .get("productVariantAppendMedia", {})
+                user_errors = ((((data or {}).get("data") or {})
+                                   .get("productVariantAppendMedia") or {})
                                    .get("userErrors", []))
             if user_errors:
                 print(f"❌ productVariantAppendMedia errors for variant {variant_id}: {user_errors}")
@@ -1328,8 +2104,7 @@ def run_uploader_logic():
         product_id = str(int(product_id)) if not pd.isna(product_id) else None
         if not product_id:
             print("Product ID not provided, creating a new product.")
-            create_new_product(updated_data)
-            return
+            return create_new_product(updated_data)
 
         url = f"{BASE_URL}/products/{product_id}.json"
         updated_data["product"] = clean_data(updated_data["product"])
@@ -1337,11 +2112,24 @@ def run_uploader_logic():
 
         if response.status_code == 404:  # Product not found, create it
             print(f"Product {product_id} not found. Creating new product.")
-            create_new_product(updated_data)
+            return create_new_product(updated_data)
         elif response.status_code == 200:
             print(f"Successfully updated product {product_id}")
+            variant_id = None
+            product_payload = response.json().get("product", {}) if response.content else {}
+            variants = product_payload.get("variants", []) if isinstance(product_payload, dict) else []
+            if variants:
+                variant_id = variants[0].get("id")
+            if not variant_id:
+                variant_id = (
+                    updated_data.get("product", {})
+                    .get("variants", [{}])[0]
+                    .get("id")
+                )
+            return product_id, variant_id
         else:
             print(f"Failed to update product {product_id}: {response.status_code}, {response.text}")
+            return None, None
         
     def update_product_by_handle(handle, updated_data):
         if not handle:
@@ -1913,7 +2701,7 @@ def run_uploader_logic():
         response = requests.post(GRAPHQL_URL, json={"query": query}, headers=graphql_headers)
         if response.status_code == 200:
             data = response.json()
-            node = data.get('data', {}).get('node', {})
+            node = (((data or {}).get('data') or {}).get('node') or {})
             url = None
             if 'url' in node:
                 url = node['url']
@@ -2118,7 +2906,7 @@ def run_uploader_logic():
                         existing_entry = fetch_file_reference(existing_files, filename)
                         if existing_entry:
                             value_gid = existing_entry[0]
-                            df.at[row_index, column] = existing_entry[1] or value_gid
+                            set_dataframe_cell(df, row_index, column, existing_entry[1] or value_gid)
                         else:
                             file_path_local = resolve_local_asset_path(candidate)
                             if file_path_local:
@@ -2127,9 +2915,9 @@ def run_uploader_logic():
                                     remember_file_reference(existing_files, filename or candidate, gid, url)
                                     value_gid = gid
                                     if url:
-                                        df.at[row_index, column] = url
+                                        set_dataframe_cell(df, row_index, column, url)
                                     else:
-                                        df.at[row_index, column] = value_gid
+                                        set_dataframe_cell(df, row_index, column, value_gid)
                                 else:
                                     print(f"❌ Failed to upload file {candidate} for metafield {namespace}.{key}")
                                     continue
@@ -2173,7 +2961,7 @@ def run_uploader_logic():
                             existing_entry = fetch_file_reference(existing_files, filename)
                             if existing_entry:
                                 value_gid = existing_entry[0]
-                                df.at[row_index, column] = existing_entry[1] or value_gid
+                                set_dataframe_cell(df, row_index, column, existing_entry[1] or value_gid)
                             else:
                                 file_path_local = resolve_local_asset_path(raw_name)
                                 if file_path_local:
@@ -2183,9 +2971,9 @@ def run_uploader_logic():
                                         remember_file_reference(existing_files, filename or raw_name, gid, url)
                                         value_gid = gid
                                         if url:
-                                            df.at[row_index, column] = url
+                                            set_dataframe_cell(df, row_index, column, url)
                                         else:
-                                            df.at[row_index, column] = value_gid
+                                            set_dataframe_cell(df, row_index, column, value_gid)
                                     else:
                                         print(f"❌ Failed to upload file {raw_name}")
                                         continue
@@ -2217,6 +3005,42 @@ def run_uploader_logic():
                     print(f"⚠️ Skipping non-string value for metafield {key}.")
                     continue
 
+            elif field_type == 'metaobject_reference':
+                value_gid = resolve_metaobject_reference_value(
+                    "PRODUCT", namespace, key, value
+                )
+                if not value_gid:
+                    continue
+
+                metafield_data = {
+                    "metafield": {
+                        "namespace": namespace,
+                        "key": key,
+                        "value": value_gid,
+                        "type": field_type.strip()
+                    }
+                }
+
+            elif field_type == 'list.metaobject_reference':
+                value_gids = resolve_metaobject_reference_list(
+                    "PRODUCT", namespace, key, value
+                )
+                if not value_gids:
+                    print(
+                        f"❌ Skipping metafield update for {namespace}.{key} because no "
+                        "metaobject references could be resolved."
+                    )
+                    continue
+
+                metafield_data = {
+                    "metafield": {
+                        "namespace": namespace,
+                        "key": key,
+                        "value": json.dumps(value_gids),
+                        "type": field_type.strip()
+                    }
+                }
+
             elif field_type == 'url':
                 if isinstance(value, str) and value.strip():
                     raw_value = value.strip()
@@ -2247,7 +3071,7 @@ def run_uploader_logic():
                         print(f"⚠️ Skipping URL metafield {namespace}.{key} due to missing URL value.")
                         continue
 
-                    df.at[row_index, column] = final_url
+                    set_dataframe_cell(df, row_index, column, final_url)
 
                     metafield_data = {
                         "metafield": {
@@ -2328,7 +3152,7 @@ def run_uploader_logic():
                         existing_entry = fetch_file_reference(existing_files, filename)
                         if existing_entry:
                             value_gid = existing_entry[0]
-                            df.at[row_index, column] = existing_entry[1] or value_gid
+                            set_dataframe_cell(df, row_index, column, existing_entry[1] or value_gid)
                         else:
                             file_path_local = resolve_local_asset_path(candidate)
                             if file_path_local:
@@ -2337,9 +3161,9 @@ def run_uploader_logic():
                                     remember_file_reference(existing_files, filename or candidate, gid, url)
                                     value_gid = gid
                                     if url:
-                                        df.at[row_index, column] = url
+                                        set_dataframe_cell(df, row_index, column, url)
                                     else:
-                                        df.at[row_index, column] = value_gid
+                                        set_dataframe_cell(df, row_index, column, value_gid)
                                 else:
                                     print(f"❌ Failed to upload file {candidate} for variant metafield {namespace}.{key}")
                                     continue
@@ -2380,7 +3204,7 @@ def run_uploader_logic():
                             existing_entry = fetch_file_reference(existing_files, filename)
                             if existing_entry:
                                 value_gid = existing_entry[0]
-                                df.at[row_index, column] = existing_entry[1] or value_gid
+                                set_dataframe_cell(df, row_index, column, existing_entry[1] or value_gid)
                             else:
                                 file_path_local = resolve_local_asset_path(raw_name)
                                 if file_path_local:
@@ -2389,9 +3213,9 @@ def run_uploader_logic():
                                         remember_file_reference(existing_files, filename or raw_name, gid, url)
                                         value_gid = gid
                                         if url:
-                                            df.at[row_index, column] = url
+                                            set_dataframe_cell(df, row_index, column, url)
                                         else:
-                                            df.at[row_index, column] = value_gid
+                                            set_dataframe_cell(df, row_index, column, value_gid)
                                     else:
                                         print(f"❌ Failed to upload file {raw_name}")
                                         continue
@@ -2419,6 +3243,42 @@ def run_uploader_logic():
                 else:
                     print(f"Skipping non-string value for metafield {key}.")
                     continue
+
+            elif field_type == 'metaobject_reference':
+                value_gid = resolve_metaobject_reference_value(
+                    "PRODUCTVARIANT", namespace, key, value
+                )
+                if not value_gid:
+                    continue
+
+                metafield_data = {
+                    "metafield": {
+                        "namespace": namespace,
+                        "key": key,
+                        "value": value_gid,
+                        "type": field_type.strip()
+                    }
+                }
+
+            elif field_type == 'list.metaobject_reference':
+                value_gids = resolve_metaobject_reference_list(
+                    "PRODUCTVARIANT", namespace, key, value
+                )
+                if not value_gids:
+                    print(
+                        f"❌ Skipping variant metafield update for {namespace}.{key} "
+                        "because no metaobject references could be resolved."
+                    )
+                    continue
+
+                metafield_data = {
+                    "metafield": {
+                        "namespace": namespace,
+                        "key": key,
+                        "value": json.dumps(value_gids),
+                        "type": field_type.strip()
+                    }
+                }
 
             elif field_type == 'url':
                 if isinstance(value, str) and value.strip():
@@ -2450,7 +3310,7 @@ def run_uploader_logic():
                         print(f"⚠️ Skipping URL metafield {namespace}.{key} due to missing URL value.")
                         continue
 
-                    df.at[row_index, column] = final_url
+                    set_dataframe_cell(df, row_index, column, final_url)
 
                     metafield_data = {
                         "metafield": {
@@ -2533,6 +3393,34 @@ def run_uploader_logic():
 
         df = pd.read_excel(file_path)
         df = df.where(pd.notnull(df), None)
+
+        def has_cell_value(value):
+            if value is None:
+                return False
+            try:
+                if pd.isna(value):
+                    return False
+            except TypeError:
+                pass
+            if isinstance(value, str):
+                return bool(value.strip())
+            return True
+
+        def get_cell_value(row_data, column_name, default=None):
+            value = row_data.get(column_name, default)
+            return value if has_cell_value(value) else default
+
+        def normalize_option_value(value, default=None):
+            if not has_cell_value(value):
+                return default
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, numbers.Number):
+                numeric_value = float(value)
+                if numeric_value.is_integer():
+                    return str(int(numeric_value))
+                return ("{0:f}".format(numeric_value)).rstrip("0").rstrip(".")
+            return str(value).strip()
 
        
 
@@ -2669,7 +3557,7 @@ def run_uploader_logic():
 
             def update_variant_cell(resolved_url):
                 if row_index is not None and resolved_url:
-                    df.at[row_index, 'Variant Image'] = resolved_url
+                    set_dataframe_cell(df, row_index, 'Variant Image', resolved_url)
 
             identifier_lookup = None
             product_images = None
@@ -2859,10 +3747,10 @@ def run_uploader_logic():
             response = requests.post(GRAPHQL_URL, json={"query": query}, headers=headers)
             if response.status_code == 200:
                 data = response.json()
-                catalogs = data.get("data", {}).get("catalogs", {}).get("nodes", [])
+                catalogs = ((((data or {}).get("data") or {}).get("catalogs")) or {}).get("nodes", [])
                 market_names = []
                 for catalog in catalogs:
-                    markets = catalog.get("markets", {}).get("nodes", [])
+                    markets = (catalog.get("markets") or {}).get("nodes", [])
                     market_names.extend([market.get("name") for market in markets if market.get("name")])
                 return market_names
             print("Failed to fetch markets.")
@@ -2927,9 +3815,9 @@ def run_uploader_logic():
             response = requests.post(GRAPHQL_URL, json={"query": query}, headers=headers)
             if response.status_code == 200:
                 data = response.json()
-                catalogs = data.get("data", {}).get("catalogs", {}).get("nodes", [])
+                catalogs = ((((data or {}).get("data") or {}).get("catalogs")) or {}).get("nodes", [])
                 for catalog in catalogs:
-                    markets = catalog.get("markets", {}).get("nodes", [])
+                    markets = (catalog.get("markets") or {}).get("nodes", [])
                     if any(market.get("name") == market_name for market in markets):
                         price_list = catalog.get("priceList")
                         if price_list and price_list.get("id"):
@@ -2988,7 +3876,7 @@ def run_uploader_logic():
                         if existing_entry:
                             gid, url = existing_entry
                             # Replace cell value with URL
-                            df.at[index, image_column] = url
+                            set_dataframe_cell(df, index, image_column, url)
                         else:
                             # Upload image to Shopify
                             file_path_local = os.path.join(IMAGE_FOLDER, filename)
@@ -3032,7 +3920,7 @@ def run_uploader_logic():
 
                                         print(f"Successfully uploaded image {filename} to product {product_id}")
                                         # Update cell value with image URL
-                                        df.at[index, image_column] = image_url
+                                        set_dataframe_cell(df, index, image_column, image_url)
 
                                         if is_valid_gid(image_gid):
                                             remember_file_reference(existing_files, filename, image_gid, image_url)
@@ -3112,25 +4000,39 @@ def run_uploader_logic():
                 continue
 
         
-            options = []
+            product_options = []
             if pd.notna(handle):  # Only aggregate options for rows with a Handle
+                seen_option_names = set()
                 for i in range(1, 4):  # Assuming a maximum of 3 options (Option1, Option2, Option3)
-                    option_name = row.get(f"Option{i} Name")
-                    if option_name and not pd.isna(option_name):  # Only add valid option names
+                    option_name = normalize_option_value(row.get(f"Option{i} Name"))
+                    if option_name:
+                        normalized_option_name = option_name.casefold()
+                        if normalized_option_name in seen_option_names:
+                            continue
+                        seen_option_names.add(normalized_option_name)
                         # Aggregate all unique values for this option across rows with the same Handle
-                        option_values = df.loc[df['Handle'] == handle, f"Option{i} Value"].dropna().unique().tolist()
-                        options.append({
-                            "name": option_name.strip(),
+                        option_values = []
+                        for candidate_value in df.loc[df['Handle'] == handle, f"Option{i} Value"].tolist():
+                            normalized_value = normalize_option_value(candidate_value)
+                            if normalized_value and normalized_value not in option_values:
+                                option_values.append(normalized_value)
+                        if not option_values and i == 1:
+                            option_values = ["Default Title"]
+                        product_options.append({
+                            "name": option_name,
                             "values": option_values
                         })
 
          
-            variant_name = f"{row.get('Option1 Value', '')} / {row.get('Option2 Value', '')} / {row.get('Option3 Value', '')}".strip(" /")
-            if not variant_name:
-                variant_name = "Default Title"
+            variant_name_parts = []
+            for i in range(1, 4):
+                normalized_variant_option = normalize_option_value(row.get(f'Option{i} Value'))
+                if normalized_variant_option:
+                    variant_name_parts.append(normalized_variant_option)
+            variant_name = " / ".join(variant_name_parts) or "Default Title"
 
             # Skip invalid or missing Product Title and Variant Name
-            if not row.get('Title') and not variant_name:
+            if not has_cell_value(row.get('Title')) and not variant_name:
                 print(f"Skipping row {index} due to missing product title and variant name.")
                 continue
 
@@ -3138,92 +4040,61 @@ def run_uploader_logic():
             variant_metafields = collect_metafields_from_row(row, 'Variant Metafield:')
 
             # Prepare the product update data if the Product ID is available
-            if row.get('Title'):
+            if has_cell_value(row.get('Title')):
+                variant_payload = {
+                    "id": variant_id,
+                    "price": row['Variant Price'],
+                    "inventory_policy": "continue" if not has_cell_value(row.get("Variant Inventory Qty")) else "deny",
+                    "inventory_quantity": int(row["Variant Inventory Qty"]) if has_cell_value(row.get("Variant Inventory Qty")) else None,
+                    "inventory_management": "shopify" if has_cell_value(row.get("Variant Inventory Qty")) else None
+                }
 
-                
-
-                # Prepare product data including options
-                options = []
-                # Supports up to 3 options (Option1, Option2, Option3)
                 for i in range(1, 4):
-                    option_name_key = f"Option{i} Name"
-                    option_value_key = f"Option{i} Value"
+                    normalized_option_value = normalize_option_value(row.get(f'Option{i} Value'))
+                    if normalized_option_value is not None:
+                        variant_payload[f"option{i}"] = normalized_option_value
 
-                    # Fetch option name, set to "Title" if empty
-                    option_name = row.get(option_name_key, f"Title {i}") if pd.notna(row.get(option_name_key)) else f"Title"
+                if has_cell_value(row.get('Variant SKU')):
+                    variant_payload["sku"] = row.get('Variant SKU')
 
-                    # Fetch option value, set to "Default Title" if empty
-                    raw_option_val = row.get(option_value_key)
+                if has_cell_value(row.get("Variant Barcode")):
+                    variant_payload["barcode"] = str(row.get("Variant Barcode")).split(".")[0]
 
-                    if pd.isna(raw_option_val) or raw_option_val is None:
-                        option_value = "Default Title"
-                    else:
-                        # Cast to string and strip ".0" if it’s an integer-like float
-                        option_value = str(raw_option_val).strip()
-                        if option_value.endswith(".0"):
-                            option_value = option_value[:-2]
+                if has_cell_value(row.get('Variant Weight')):
+                    variant_payload["weight"] = row.get('Variant Weight')
 
-
-                    # Append option to the list if the option name key exists in the row (assuming that it should be there to consider)
-                    if option_name_key in row:
-                        options.append({
-                            "name": option_name,
-                            "value": option_value
-                        })
+                if has_cell_value(row.get('Variant Weight Unit')):
+                    variant_payload["weight_unit"] = row.get('Variant Weight Unit')
 
                 product_data = {
                     "product": {
                         "id": product_id,
                         "title": row['Title'],
-                        "options": options,  # Include the options in product data
-                        "variants": [  # Define variants as a list
-                            {
-                                "id": variant_id,
-                                "price": row['Variant Price'],
-                                "option1": row.get('Option1 Value', ""),  # Add Option1 Value
-                                "option2": row.get('Option2 Value', ""),  # Add Option2 Value
-                                "option3": row.get('Option3 Value', ""),  # Add Option3 Value
-                                # Conditionally add 'sku' if present and valid
-                                "sku": row.get('Variant SKU') if row.get('Variant SKU') else None,
-                                # Conditionally add 'barcode' if present and valid
-                                "barcode": str(row.get("Variant Barcode")).split(".")[0] if pd.notna(row.get("Variant Barcode")) else None,
-                                # Conditionally add 'weight' if present and valid
-                                "weight": row.get('Variant Weight') if row.get('Variant Weight') else None,
-                                # Conditionally add 'weight_unit' if present and valid
-                                "weight_unit": row.get('Variant Weight Unit') if row.get('Variant Weight Unit') else None,
-                                # Add inventory policy based on inventory quantity
-                                "inventory_policy": "continue" if not pd.notna(row.get("Variant Inventory Qty")) else "deny",
-                                # Add inventory quantity to update stock levels
-                                "inventory_quantity": int(row["Variant Inventory Qty"]) if pd.notna(row.get("Variant Inventory Qty")) else None,
-                                # Automatically set inventory management based on quantity
-                                "inventory_management": "shopify" if pd.notna(row.get("Variant Inventory Qty")) else None
-
-
-                            }
-                        ]
+                        "options": product_options or [{"name": "Title", "values": ["Default Title"]}],
+                        "variants": [variant_payload]
                     }
                 }
 
                 # Add optional fields only if they exist or have valid values
-                if row.get('Body HTML'):
+                if has_cell_value(row.get('Body HTML')):
                     product_data["product"]["body_html"] = row['Body HTML']
 
 
-                if row.get('Type'):
+                if has_cell_value(row.get('Type')):
                     product_data["product"]["product_type"] = row['Type']
 
-                if row.get('Template Suffix'):
+                if has_cell_value(row.get('Template Suffix')):
                     product_data["product"]["template_suffix"] = row['Template Suffix']
 
                 # Conditionally add 'vendor' if present and valid
-                if row.get('Vendor'):
+                if has_cell_value(row.get('Vendor')):
                     product_data["product"]["vendor"] = row['Vendor']
 
                 # Conditionally add 'tags' if present and valid
-                if row.get('Tags'):
+                if has_cell_value(row.get('Tags')):
                     product_data["product"]["tags"] = row['Tags']
 
-                if row.get('Status'):
+                if has_cell_value(row.get('Status')):
                     product_data["product"]["status"] = row['Status']
 
                 
@@ -3235,7 +4106,9 @@ def run_uploader_logic():
                                 
                 if product_id and variant_id:
                     print(f"Updating product with ID '{product_id}' and variant ID '{variant_id}'...")
-                    update_product(product_id, product_data)
+                    product_id, updated_variant_id = update_product(product_id, product_data)
+                    if updated_variant_id:
+                        variant_id = updated_variant_id
                 elif handle:
                     print(f"No valid product or variant ID found. Updating by handle '{handle}'...")
                     product_id, variant_id = update_product_by_handle(handle, product_data)
@@ -3244,10 +4117,10 @@ def run_uploader_logic():
                     product_id, variant_id = update_product_by_sku(sku, product_data)
 
                 if product_id:
-                    print(f"Product created successfully with ID '{product_id}' and Variand ID '{variant_id}'  .")
-                    df.at[index, 'ID'] = product_id
+                    print(f"Product processed successfully with ID '{product_id}' and Variant ID '{variant_id}'.")
+                    set_dataframe_cell(df, index, 'ID', int(product_id))
                     if variant_id:
-                        df.at[index, 'Variant ID'] = variant_id
+                        set_dataframe_cell(df, index, 'Variant ID', int(variant_id))
 
 
                     # Handle market-specific pricing dynamically
@@ -3278,82 +4151,86 @@ def run_uploader_logic():
                 else:
                     print("Failed to create a new product.")
 
-                print("Updating Images and Metafields now.")
+                if product_id:
+                    print("Updating Images and Metafields now.")
 
+                    # Collect image URLs and alt texts
+                    images = []
+                    alt_texts = []
+                    for i in range(1, 21):
+                        image_column = f"Image {i}"
+                        alt_column = f"Image {i} Alt"
+                        image_url = row.get(image_column)
+                        alt_text = row.get(alt_column)
 
-                # Collect image URLs and alt texts
-                images = []
-                alt_texts = []
-                for i in range(1, 21):
-                    image_column = f"Image {i}"
-                    alt_column = f"Image {i} Alt"
-                    image_url = row.get(image_column)
-                    alt_text = row.get(alt_column)
-
-                    if image_url and isinstance(image_url, str):
-                        if image_url.startswith('http'):
-                            # If it's already a URL, append it directly
-                            images.append(image_url)
-                            alt_texts.append(alt_text)
-                        else:
-                            # Handle local file upload (if necessary)
-                            filename = image_url
-                            file_path_local = os.path.join(IMAGE_FOLDER, filename)
-                            if os.path.exists(file_path_local):
-                                # Upload the image and get the URL
-                                with open(file_path_local, "rb") as image_file:
-                                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                                image_data = {
-                                    "image": {
-                                        "attachment": encoded_string,
-                                        "filename": filename,
-                                        "alt": alt_text if pd.notna(alt_text) else filename
-                                    }
-                                }
-                                url_api = f"{BASE_URL}/products/{product_id}/images.json"
-                                response = requests.post(url_api, headers=headers, json=image_data)
-                                if response.status_code in [200, 201]:
-                                    image = response.json().get('image', {})
-                                    image_url = image.get('src')
-                                    print(f"Successfully uploaded image {filename} to product {product_id}")
-                                    # Update cell value with image URL
-                                    df.at[index, image_column] = image_url
-                                    images.append(image_url)
-                                    alt_texts.append(alt_text)
-                                else:
-                                    print(f"Failed to upload image {filename} to product {product_id}: {response.status_code}, {response.text}")
+                        if image_url and isinstance(image_url, str):
+                            if image_url.startswith('http'):
+                                # If it's already a URL, append it directly
+                                images.append(image_url)
+                                alt_texts.append(alt_text)
                             else:
-                                print(f"Image file {filename} not found in local folder.")
-                    else:
-                        continue  # Skip if image URL is not valid
+                                # Handle local file upload (if necessary)
+                                filename = image_url
+                                file_path_local = os.path.join(IMAGE_FOLDER, filename)
+                                if os.path.exists(file_path_local):
+                                    # Upload the image and get the URL
+                                    with open(file_path_local, "rb") as image_file:
+                                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                                    image_data = {
+                                        "image": {
+                                            "attachment": encoded_string,
+                                            "filename": filename,
+                                            "alt": alt_text if pd.notna(alt_text) else filename
+                                        }
+                                    }
+                                    url_api = f"{BASE_URL}/products/{product_id}/images.json"
+                                    response = requests.post(url_api, headers=headers, json=image_data)
+                                    if response.status_code in [200, 201]:
+                                        image = response.json().get('image', {})
+                                        image_url = image.get('src')
+                                        print(f"Successfully uploaded image {filename} to product {product_id}")
+                                        # Update cell value with image URL
+                                        set_dataframe_cell(df, index, image_column, image_url)
+                                        images.append(image_url)
+                                        alt_texts.append(alt_text)
+                                    else:
+                                        print(f"Failed to upload image {filename} to product {product_id}: {response.status_code}, {response.text}")
+                                else:
+                                    print(f"Image file {filename} not found in local folder.")
+                        else:
+                            continue  # Skip if image URL is not valid
 
-                # Update product images with alt texts
-                if images:
-                    update_product_images(product_id, images, alt_texts)
+                    # Update product images with alt texts
+                    if images:
+                        update_product_images(product_id, images, alt_texts)
 
-                    # Retrieve the updated images to get their IDs
-                    product_images = get_product_images(product_id, force_refresh=True)
-                    if not product_images:
-                        print(f"No images retrieved for product {product_id} after update.")
+                        # Retrieve the updated images to get their IDs
+                        product_images = get_product_images(product_id, force_refresh=True)
+                        if not product_images:
+                            print(f"No images retrieved for product {product_id} after update.")
 
-                # Update metafields for the product
-                if metafields:
-                    if pd.notna(product_id):
-                        update_metafields(product_id, metafields, existing_files, index, df)
-                    else:
-                        print(f"Product ID missing for row {index}, cannot update metafields.")
+                    # Update metafields for the product
+                    if metafields:
+                        if pd.notna(product_id):
+                            update_metafields(product_id, metafields, existing_files, index, df)
+                        else:
+                            print(f"Product ID missing for row {index}, cannot update metafields.")
+                else:
+                    print("Skipping product images and product metafields because the product update did not succeed.")
 
             # Prepare the variant update data if there is a variant
             if variant_name:
-                variant_data = {
-                    "variant": {
-                        "id": variant_id,
-                        "price": row['Variant Price'],
-                        "option1": row.get('Option1 Value', ""),
-                        "option2": row.get('Option2 Value', ""),
-                        "option3": row.get('Option3 Value', ""),
-                    }
+                variant_payload = {
+                    "id": variant_id,
+                    "price": row['Variant Price'],
                 }
+
+                for i in range(1, 4):
+                    normalized_variant_option = normalize_option_value(row.get(f'Option{i} Value'))
+                    if normalized_variant_option is not None:
+                        variant_payload[f"option{i}"] = normalized_variant_option
+
+                variant_data = {"variant": variant_payload}
 
                 variant_image_value = row.get('Variant Image')
                 variant_image_alt = row.get('Variant Image Alt')
@@ -3400,11 +4277,11 @@ def run_uploader_logic():
 
                     if cached_identifier == normalized_identifier or not normalized_identifier:
                         if cached_url:
-                            df.at[index, 'Variant Image'] = cached_url
+                            set_dataframe_cell(df, index, 'Variant Image', cached_url)
                         image_id = cached_image_id
                         media_id = cached_media_id
 
-                if not image_id and not media_id and variant_image_value:
+                if not image_id and not media_id and has_cell_value(variant_image_value):
                     image_id, media_id = ensure_variant_image(
                         product_id, variant_image_value, variant_image_alt, index, handle
                     )
@@ -3428,27 +4305,27 @@ def run_uploader_logic():
                 if image_id:
                     variant_data["variant"]["image_id"] = image_id
 
-                if row.get('Variant SKU'):
+                if has_cell_value(row.get('Variant SKU')):
                     variant_data["variant"]["sku"] = row['Variant SKU']
 
-                if row.get('Variant Barcode'):
+                if has_cell_value(row.get('Variant Barcode')):
                     variant_data["variant"]["barcode"] = (
                         str(int(row["Variant Barcode"]))
                         if pd.notna(row.get("Variant Barcode")) and str(row.get("Variant Barcode")).strip() != ""
                         else None
                     )
 
-                if row.get('Variant Weight'):
+                if has_cell_value(row.get('Variant Weight')):
                     variant_data["variant"]["weight"] = row['Variant Weight']
 
-                if row.get('Variant Weight Unit'):
+                if has_cell_value(row.get('Variant Weight Unit')):
                     variant_data["variant"]["weight_unit"] = row['Variant Weight Unit']
 
                 variant_data["variant"]["inventory_policy"] = (
-                    "continue" if not pd.notna(row.get("Variant Inventory Qty")) else "deny"
+                    "continue" if not has_cell_value(row.get("Variant Inventory Qty")) else "deny"
                 )
 
-                if pd.notna(row.get("Variant Inventory Qty")):
+                if has_cell_value(row.get("Variant Inventory Qty")):
                     inventory_qty = int(row["Variant Inventory Qty"])
                     variant_data["variant"]["inventory_quantity"] = inventory_qty
                     variant_data["variant"]["inventory_management"] = "shopify" if inventory_qty > 0 else None
@@ -3462,7 +4339,7 @@ def run_uploader_logic():
             variant_id = update_or_create_variant_by_handle(handle, variant_data)
 
             if variant_id:
-                df.at[index, 'Variant ID'] = variant_id
+                set_dataframe_cell(df, index, 'Variant ID', int(variant_id))
                 print(f"Variant processed successfully with ID: {variant_id}")
                 # Proceed with additional logic using `variant_id`, like setting market-specific prices
 
@@ -3544,6 +4421,7 @@ def collection_run_downloader_logic():
     shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
+    log_shopify_access_scope_diagnostics(shopify_context)
 
     # Shopify API URL
     BASE_URL = shopify_context["base_url"]
@@ -3706,6 +4584,7 @@ def collection_run_uploader_logic():
     shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
+    log_shopify_access_scope_diagnostics(shopify_context)
 
     # Shopify API URLs
     BASE_URL = shopify_context["base_url"]
@@ -3870,7 +4749,7 @@ def collection_run_uploader_logic():
         response = requests.post(GRAPHQL_URL, json={"query": query}, headers=graphql_headers)
         if response.status_code == 200:
             data = response.json()
-            node = data.get('data', {}).get('node', {})
+            node = (((data or {}).get('data') or {}).get('node') or {})
             url = None
             if 'url' in node:
                 url = node['url']
@@ -3973,7 +4852,7 @@ def collection_run_uploader_logic():
             response = requests.post(GRAPHQL_URL, json={"query": query}, headers=headers)
             if response.status_code == 200:
                 data = response.json()
-                for file in data.get("data", {}).get("files", {}).get("edges", []):
+                for file in ((((data or {}).get("data") or {}).get("files")) or {}).get("edges", []):
                     node = file["node"]
                     gid = node["id"]
                     alt = node["alt"]
@@ -4043,7 +4922,7 @@ def collection_run_uploader_logic():
                         existing_entry = fetch_file_reference(existing_files, filename)
                         if existing_entry:
                             value_gid = existing_entry[0]
-                            df.at[row_index, column] = existing_entry[1] or value_gid
+                            set_dataframe_cell(df, row_index, column, existing_entry[1] or value_gid)
                             print(f"✅ Found existing upload: {candidate}, GID: {value_gid}")
                         else:
                             file_path_local = resolve_local_asset_path(candidate)
@@ -4053,7 +4932,7 @@ def collection_run_uploader_logic():
                                 if gid and uploaded_url:
                                     remember_file_reference(existing_files, filename or candidate, gid, uploaded_url)
                                     value_gid = gid
-                                    df.at[row_index, column] = uploaded_url
+                                    set_dataframe_cell(df, row_index, column, uploaded_url)
                                     print(f"✅ Successfully uploaded '{candidate}', New GID: {value_gid}")
                                 else:
                                     print(f"❌ Failed to upload file '{candidate}', skipping metafield update.")
@@ -4100,7 +4979,7 @@ def collection_run_uploader_logic():
                             existing_entry = fetch_file_reference(existing_files, filename)
                             if existing_entry:
                                 value_gid = existing_entry[0]
-                                df.at[row_index, column] = existing_entry[1] or value_gid
+                                set_dataframe_cell(df, row_index, column, existing_entry[1] or value_gid)
                                 print(f"✅ Found existing upload for {raw_name}, GID: {value_gid}")
                             else:
                                 file_path_local = resolve_local_asset_path(raw_name)
@@ -4110,7 +4989,7 @@ def collection_run_uploader_logic():
                                     if gid and uploaded_url:
                                         remember_file_reference(existing_files, filename or raw_name, gid, uploaded_url)
                                         value_gid = gid
-                                        df.at[row_index, column] = uploaded_url
+                                        set_dataframe_cell(df, row_index, column, uploaded_url)
                                         print(f"✅ Successfully uploaded {raw_name}, new GID: {value_gid}")
                                     else:
                                         print(f"❌ Failed to upload file {raw_name}")
@@ -4176,7 +5055,7 @@ def collection_run_uploader_logic():
                         print(f"⚠️ Skipping URL metafield {namespace}.{key} due to missing URL value.")
                         continue
 
-                    df.at[row_index, column] = final_url
+                    set_dataframe_cell(df, row_index, column, final_url)
 
                     metafield_data = {
                         "metafield": {
@@ -4354,59 +5233,55 @@ def start_download():
     def after_download():
         download_button.config(state=tk.NORMAL)
         upload_button.config(state=tk.NORMAL)
-        messagebox.showinfo("Success", "Download completed!")
 
     download_button.config(state=tk.DISABLED)
     upload_button.config(state=tk.DISABLED)
 
     # Start download in a separate thread
-    thread = threading.Thread(target=run_downloader_logic)
+    thread = build_safe_thread("Download", run_downloader_logic)
     thread.start()
 
     # Wait for the thread to finish and then re-enable buttons
-    root.after(100, check_thread, thread, after_download)
+    root.after(100, check_thread, thread, after_download, "Download completed!")
 
 def start_upload():
     def after_upload():
         download_button.config(state=tk.NORMAL)
         upload_button.config(state=tk.NORMAL)
-        messagebox.showinfo("Success", "Upload completed!")
 
     download_button.config(state=tk.DISABLED)
     upload_button.config(state=tk.DISABLED)
 
     # Start upload in a separate thread
-    thread = threading.Thread(target=run_uploader_logic)
+    thread = build_safe_thread("Upload", run_uploader_logic)
     thread.start()
 
     # Wait for the thread to finish and then re-enable buttons
-    root.after(100, check_thread, thread, after_upload)
+    root.after(100, check_thread, thread, after_upload, "Upload completed!")
 
 def start_collection_download():
     def after_collection_download():
         collection_download_button.config(state=tk.NORMAL)
         collection_upload_button.config(state=tk.NORMAL)
-        messagebox.showinfo("Success", "Download completed!")
     
     collection_download_button.config(state=tk.DISABLED)
     collection_upload_button.config(state=tk.DISABLED)
     
-    thread = threading.Thread(target=collection_run_downloader_logic)
+    thread = build_safe_thread("Collection download", collection_run_downloader_logic)
     thread.start()
-    root.after(100, check_thread, thread, after_collection_download)
+    root.after(100, check_thread, thread, after_collection_download, "Download completed!")
 
 def start_collection_upload():
     def after_collection_upload():
         collection_download_button.config(state=tk.NORMAL)
         collection_upload_button.config(state=tk.NORMAL)
-        messagebox.showinfo("Success", "Upload completed!")
     
     collection_download_button.config(state=tk.DISABLED)
     collection_upload_button.config(state=tk.DISABLED)
     
-    thread = threading.Thread(target=collection_run_uploader_logic)
+    thread = build_safe_thread("Collection upload", collection_run_uploader_logic)
     thread.start()
-    root.after(100, check_thread, thread, after_collection_upload)
+    root.after(100, check_thread, thread, after_collection_upload, "Upload completed!")
 
 def download_shopify_files_alt_texts():
     import requests
@@ -4666,7 +5541,7 @@ def generate_seo_alt_texts():
             )
 
             generated_text = response.choices[0].message.content
-            df.at[index, "New Alt Text"] = generated_text.strip()
+            set_dataframe_cell(df, index, "New Alt Text", generated_text.strip())
             print(f"✅ Generated new alt text for row {index} – {generated_text.strip()}")
 
             # 🔁 Save backup every 5 rows
@@ -4711,13 +5586,45 @@ def beautify_store_name(store_name):
     name = name.title()
     return name
 
-def check_thread(thread, callback):
+def check_thread(thread, callback, success_message=None):
     if thread.is_alive():
         # If the thread is still running, check again after 100 ms
-        root.after(100, check_thread, thread, callback)
+        root.after(100, check_thread, thread, callback, success_message)
     else:
-        # If the thread has finished, run the callback
         callback()
+
+        if getattr(thread, "task_failed", False):
+            messagebox.showerror(
+                "Error",
+                getattr(thread, "error_message", "The operation failed."),
+            )
+            return
+
+        if success_message:
+            messagebox.showinfo("Success", success_message)
+
+
+def build_safe_thread(task_name, target):
+    def runner():
+        current_thread = threading.current_thread()
+        current_thread.task_failed = False
+        current_thread.error_message = ""
+        try:
+            target()
+        except Exception as exc:
+            current_thread.task_failed = True
+            current_thread.error_message = f"{task_name} failed: {exc}"
+            traceback.print_exc()
+            print(f"❌ {current_thread.error_message}")
+
+    thread = threading.Thread(target=runner)
+    thread.task_failed = False
+    thread.error_message = ""
+    return thread
+
+
+def start_detached_task(task_name, target):
+    build_safe_thread(task_name, target).start()
 
 # Function to load the rest of the logic after GUI is created
 def load_background_logic():
@@ -4762,20 +5669,20 @@ collection_download_button.grid(row=2, column=0, pady=5)
 collection_upload_button = tk.Button(root, text="Upload Collections", command=start_collection_upload, width=20, height=2)
 collection_upload_button.grid(row=2, column=1, pady=5)
 
-file_alt_download_button = tk.Button(root, text="Download Files Alt Texts", command=lambda: threading.Thread(target=download_shopify_files_alt_texts).start(), width=25, height=2)
+file_alt_download_button = tk.Button(root, text="Download Files Alt Texts", command=lambda: start_detached_task("Download Files Alt Texts", download_shopify_files_alt_texts), width=25, height=2)
 file_alt_download_button.grid(row=3, column=0, pady=5)
 
-file_alt_upload_button = tk.Button(root, text="Upload Files Alt Texts", command=lambda: threading.Thread(target=upload_shopify_files_alt_texts).start(), width=25, height=2)
+file_alt_upload_button = tk.Button(root, text="Upload Files Alt Texts", command=lambda: start_detached_task("Upload Files Alt Texts", upload_shopify_files_alt_texts), width=25, height=2)
 file_alt_upload_button.grid(row=3, column=1, pady=5)
 
-seo_alt_text_button = tk.Button(root, text="Generate SEO Alt Texts (AI)", command=lambda: threading.Thread(target=generate_seo_alt_texts).start(), width=30, height=2)
+seo_alt_text_button = tk.Button(root, text="Generate SEO Alt Texts (AI)", command=lambda: start_detached_task("Generate SEO Alt Texts (AI)", generate_seo_alt_texts), width=30, height=2)
 seo_alt_text_button.grid(row=4, column=0, columnspan=2, pady=5)
 
 # Set window size
 root.geometry("500x700")
 
 # Show the window first, then load heavy logic in the background
-root.after(100, lambda: threading.Thread(target=load_background_logic).start())
+root.after(100, lambda: start_detached_task("Background setup", load_background_logic))
 
 # Run the application
 root.mainloop()
