@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { ChangeEvent, CSSProperties } from "react";
 import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { useRouteError } from "react-router";
@@ -76,11 +76,11 @@ const BULK_WORKFLOW_MODULES: BulkWorkflowModule[] = [
     kicker: "Products",
     title: "Catalog spreadsheet",
     summary:
-      "Download product data, variants, images, metafields, and inventory columns into one workbook.",
+      "Variants, images, metafields, and inventory in one XLSX export.",
     downloadDescription:
-      "Create a fresh XLSX workbook from Shopify before making bulk changes.",
+      "Create a fresh workbook from the live store.",
     uploadDescription:
-      "Upload the edited workbook to apply product changes with the existing Python sheet logic.",
+      "Upload your edited workbook to apply product changes.",
     dropZoneLabel: "Products spreadsheet",
     downloadButtonLabel: "Download workbook",
     uploadButtonLabel: "Upload workbook",
@@ -104,11 +104,11 @@ const BULK_WORKFLOW_MODULES: BulkWorkflowModule[] = [
     kicker: "Metaobjects",
     title: "Content models workbook",
     summary:
-      "Export metaobject records, definitions, handles, status, and field values into a single file.",
+      "Definitions, handles, statuses, and values in one spreadsheet.",
     downloadDescription:
-      "Pull the latest metaobject records into XLSX so edits start from the current store state.",
+      "Pull the latest metaobject records into XLSX.",
     uploadDescription:
-      "Upload the edited workbook to create or update records, handles, statuses, and field values.",
+      "Upload the workbook to create or update records.",
     dropZoneLabel: "Metaobjects spreadsheet",
     downloadButtonLabel: "Download workbook",
     uploadButtonLabel: "Upload workbook",
@@ -133,11 +133,11 @@ const BULK_WORKFLOW_MODULES: BulkWorkflowModule[] = [
     kicker: "Collections",
     title: "Collection rules workbook",
     summary:
-      "Manage manual and smart collections, products, conditions, images, and collection metafields.",
+      "Manual and smart collections, rules, images, and metafields.",
     downloadDescription:
-      "Create an XLSX snapshot of your current custom and smart collections before editing.",
+      "Export the current collection setup into XLSX.",
     uploadDescription:
-      "Upload the workbook after editing to apply collection updates back into Shopify.",
+      "Upload the workbook to sync collection changes.",
     dropZoneLabel: "Collections spreadsheet",
     downloadButtonLabel: "Download workbook",
     uploadButtonLabel: "Upload workbook",
@@ -162,11 +162,11 @@ const BULK_WORKFLOW_MODULES: BulkWorkflowModule[] = [
     kicker: "Files",
     title: "Alt text workbook",
     summary:
-      "Review uploaded files, current alt text, file IDs, and URLs, then bulk-update alt text in one pass.",
+      "File URLs, current alt text, and new alt text updates.",
     downloadDescription:
-      "Export your files into XLSX so the team can review or rewrite alt text offline.",
+      "Export your files into a workbook for review.",
     uploadDescription:
-      "Edit the `New Alt Text` column in the workbook, then upload it to update Shopify file alt text.",
+      "Upload the workbook to update Shopify file alt text.",
     dropZoneLabel: "Files alt-text spreadsheet",
     downloadButtonLabel: "Download workbook",
     uploadButtonLabel: "Upload workbook",
@@ -189,30 +189,28 @@ const BULK_WORKFLOW_MODULES: BulkWorkflowModule[] = [
 ];
 
 const dashboardGridStyle: CSSProperties = {
-  alignItems: "start",
   display: "grid",
   gap: "1rem",
-  gridTemplateColumns: "repeat(auto-fit, minmax(28rem, 1fr))",
 };
 
 const moduleCardStyle: CSSProperties = {
   background: "#ffffff",
-  border: "1px solid rgba(15, 23, 42, 0.08)",
-  borderRadius: "20px",
-  boxShadow: "0 14px 34px rgba(15, 23, 42, 0.06)",
+  border: "1px solid #e4e7ec",
+  borderRadius: "24px",
+  boxShadow: "0 1px 2px rgba(16, 24, 40, 0.04)",
   display: "grid",
   gap: "1rem",
-  padding: "1.25rem",
+  padding: "1.35rem",
 };
 
 const moduleHeaderStyle: CSSProperties = {
   display: "grid",
-  gap: "0.5rem",
+  gap: "0.45rem",
 };
 
 const moduleKickerStyle: CSSProperties = {
   color: "#667085",
-  fontSize: "0.75rem",
+  fontSize: "0.72rem",
   fontWeight: 700,
   letterSpacing: "0.08em",
   margin: 0,
@@ -221,31 +219,35 @@ const moduleKickerStyle: CSSProperties = {
 
 const moduleTitleStyle: CSSProperties = {
   color: "#101828",
-  fontSize: "1.25rem",
+  fontSize: "1.5rem",
+  fontWeight: 700,
   lineHeight: 1.2,
   margin: 0,
 };
 
 const moduleSummaryStyle: CSSProperties = {
   color: "#475467",
-  fontSize: "0.95rem",
-  lineHeight: 1.6,
+  fontSize: "0.98rem",
+  lineHeight: 1.55,
   margin: 0,
+  maxWidth: "52rem",
 };
 
 const moduleActionGridStyle: CSSProperties = {
   display: "grid",
-  gap: "0.875rem",
-  gridTemplateColumns: "repeat(auto-fit, minmax(16rem, 1fr))",
+  gap: "1rem",
+  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
 };
 
 const moduleActionCardStyle: CSSProperties = {
-  background: "linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)",
-  border: "1px solid rgba(15, 23, 42, 0.08)",
-  borderRadius: "16px",
-  display: "grid",
-  gap: "0.75rem",
-  padding: "1rem",
+  background: "#f8fafc",
+  border: "1px solid #e4e7ec",
+  borderRadius: "20px",
+  display: "flex",
+  flexDirection: "column",
+  gap: "1rem",
+  minHeight: "17rem",
+  padding: "1.15rem",
 };
 
 const moduleActionLabelStyle: CSSProperties = {
@@ -259,106 +261,116 @@ const moduleActionLabelStyle: CSSProperties = {
 
 const moduleActionTitleStyle: CSSProperties = {
   color: "#101828",
-  fontSize: "1rem",
+  fontSize: "1.1rem",
+  fontWeight: 700,
   lineHeight: 1.3,
   margin: 0,
 };
 
 const pageShellStyle: CSSProperties = {
-  background:
-    "radial-gradient(circle at top left, rgba(59, 130, 246, 0.08), transparent 30%), linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%)",
+  background: "#f3f4f6",
+  fontFamily:
+    'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
   minHeight: "100vh",
-  padding: "1.5rem",
+  padding: "1rem",
 };
 
 const pageInnerStyle: CSSProperties = {
   display: "grid",
-  gap: "1.5rem",
+  gap: "1rem",
   margin: "0 auto",
-  maxWidth: "1400px",
-};
-
-const pageHeadingStyle: CSSProperties = {
-  color: "#101828",
-  fontSize: "2rem",
-  lineHeight: 1.1,
-  margin: 0,
-};
-
-const pageSubheadingStyle: CSSProperties = {
-  color: "#475467",
-  fontSize: "1rem",
-  lineHeight: 1.6,
-  margin: 0,
-  maxWidth: "52rem",
+  maxWidth: "1280px",
 };
 
 const actionBodyStyle: CSSProperties = {
   display: "grid",
-  gap: "0.75rem",
+  gap: "0.65rem",
+};
+
+const actionFooterStyle: CSSProperties = {
+  display: "grid",
+  gap: "0.85rem",
+  marginTop: "auto",
 };
 
 const bodyCopyStyle: CSSProperties = {
   color: "#475467",
   fontSize: "0.95rem",
-  lineHeight: 1.6,
+  lineHeight: 1.55,
   margin: 0,
 };
 
-const inputLabelStyle: CSSProperties = {
-  color: "#344054",
-  fontSize: "0.875rem",
-  fontWeight: 600,
-  margin: 0,
+const hiddenFileInputStyle: CSSProperties = {
+  display: "none",
 };
 
-const fileInputStyle: CSSProperties = {
-  background: "#ffffff",
-  border: "1px solid #d0d5dd",
-  borderRadius: "12px",
-  color: "#101828",
-  fontSize: "0.95rem",
-  padding: "0.875rem 1rem",
-  width: "100%",
+const filePickerStyle: CSSProperties = {
+  display: "grid",
+  gap: "0.7rem",
 };
 
-const buttonRowStyle: CSSProperties = {
+const filePickerRowStyle: CSSProperties = {
   display: "flex",
   flexWrap: "wrap",
   gap: "0.75rem",
+  width: "100%",
 };
 
 const primaryButtonStyle: CSSProperties = {
+  alignItems: "center",
   appearance: "none",
   background: "#111827",
   border: "1px solid #111827",
-  borderRadius: "999px",
+  borderRadius: "14px",
   color: "#ffffff",
   cursor: "pointer",
+  display: "inline-flex",
   fontSize: "0.95rem",
-  fontWeight: 600,
-  minHeight: "2.75rem",
-  padding: "0.75rem 1.25rem",
+  fontWeight: 700,
+  justifyContent: "center",
+  minHeight: "3rem",
+  padding: "0.85rem 1.1rem",
+  width: "100%",
 };
 
 const secondaryButtonStyle: CSSProperties = {
+  alignItems: "center",
   appearance: "none",
   background: "#ffffff",
   border: "1px solid #d0d5dd",
-  borderRadius: "999px",
+  borderRadius: "14px",
   color: "#101828",
   cursor: "pointer",
+  display: "inline-flex",
   fontSize: "0.95rem",
   fontWeight: 600,
-  minHeight: "2.75rem",
-  padding: "0.75rem 1.25rem",
+  justifyContent: "center",
+  minHeight: "3rem",
+  padding: "0.85rem 1rem",
+  width: "100%",
 };
 
-const selectedFileStyle: CSSProperties = {
-  color: "#0f172a",
-  fontSize: "0.9rem",
-  lineHeight: 1.5,
+const fileChooseButtonStyle: CSSProperties = {
+  ...secondaryButtonStyle,
+  minWidth: "10.5rem",
+  width: "auto",
+};
+
+const fileNameStyle: CSSProperties = {
+  alignItems: "center",
+  background: "#ffffff",
+  border: "1px solid #d0d5dd",
+  borderRadius: "14px",
+  color: "#475467",
+  display: "flex",
+  flex: "1 1 14rem",
+  fontSize: "0.92rem",
+  minHeight: "3rem",
   margin: 0,
+  overflow: "hidden",
+  padding: "0.85rem 1rem",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
 };
 
 function createInitialWorkflowState(): WorkflowState {
@@ -451,6 +463,9 @@ export default function Index() {
   const [workflowState, setWorkflowState] = useState<WorkflowState>(
     createInitialWorkflowState,
   );
+  const fileInputRefs = useRef<
+    Partial<Record<ModuleId, HTMLInputElement | null>>
+  >({});
 
   function updateWorkflowState(
     moduleId: ModuleId,
@@ -463,6 +478,23 @@ export default function Index() {
         ...nextState,
       },
     }));
+  }
+
+  function setFileInputRef(moduleId: ModuleId) {
+    return (element: HTMLInputElement | null) => {
+      fileInputRefs.current[moduleId] = element;
+    };
+  }
+
+  function openFilePicker(moduleId: ModuleId) {
+    const input = fileInputRefs.current[moduleId];
+
+    if (!input) {
+      return;
+    }
+
+    input.value = "";
+    input.click();
   }
 
   async function startBulkJob(
@@ -635,6 +667,10 @@ export default function Index() {
       );
 
       triggerFileDownload(spreadsheetBlob, fileName);
+      const input = fileInputRefs.current[module.id];
+      if (input) {
+        input.value = "";
+      }
       updateWorkflowState(module.id, { selectedFile: null });
       showToast(module.uploadSuccessMessage);
     } catch (error) {
@@ -652,14 +688,6 @@ export default function Index() {
   return (
     <div style={pageShellStyle}>
       <div style={pageInnerStyle}>
-        <div style={moduleHeaderStyle}>
-          <h1 style={pageHeadingStyle}>HUX Bulk Loader</h1>
-          <p style={pageSubheadingStyle}>
-            Download the current Shopify workbook, make your edits offline, and
-            upload the revised spreadsheet when you are ready.
-          </p>
-        </div>
-
         <div style={dashboardGridStyle}>
         {BULK_WORKFLOW_MODULES.map((module) => {
           const state = workflowState[module.id];
@@ -684,7 +712,9 @@ export default function Index() {
                     <p style={moduleActionLabelStyle}>Download</p>
                     <h3 style={moduleActionTitleStyle}>Current workbook</h3>
                     <p style={bodyCopyStyle}>{module.downloadDescription}</p>
-                    <div style={buttonRowStyle}>
+                  </div>
+                  <div style={actionFooterStyle}>
+                    <div>
                       <button
                         type="button"
                         style={actionButtonStyle}
@@ -704,24 +734,49 @@ export default function Index() {
                     <p style={moduleActionLabelStyle}>Upload</p>
                     <h3 style={moduleActionTitleStyle}>Apply your edits</h3>
                     <p style={bodyCopyStyle}>{module.uploadDescription}</p>
-                    <label style={inputLabelStyle}>
-                      {module.dropZoneLabel}
+                  </div>
+                  <div style={actionFooterStyle}>
+                    <div style={filePickerStyle}>
                       <input
+                        ref={setFileInputRef(module.id)}
                         type="file"
                         accept=".xlsx"
                         onChange={(event) =>
                           handleFileSelection(module.id, event)
                         }
                         disabled={state.isUploading}
-                        style={fileInputStyle}
+                        aria-label={module.dropZoneLabel}
+                        style={hiddenFileInputStyle}
                       />
-                    </label>
-                    {state.selectedFile ? (
-                      <p style={selectedFileStyle}>
-                        Selected file: {state.selectedFile.name}
-                      </p>
-                    ) : null}
-                    <div style={buttonRowStyle}>
+                      <div style={filePickerRowStyle}>
+                        <button
+                          type="button"
+                          style={
+                            state.isUploading
+                              ? {
+                                  ...fileChooseButtonStyle,
+                                  cursor: "wait",
+                                  opacity: 0.7,
+                                }
+                              : fileChooseButtonStyle
+                          }
+                          onClick={() => openFilePicker(module.id)}
+                          disabled={state.isUploading || state.isDownloading}
+                        >
+                          Choose workbook
+                        </button>
+                        <p
+                          style={{
+                            ...fileNameStyle,
+                            color: state.selectedFile ? "#101828" : "#667085",
+                          }}
+                          title={state.selectedFile?.name ?? "No workbook selected"}
+                        >
+                          {state.selectedFile?.name ?? "No workbook selected"}
+                        </p>
+                      </div>
+                    </div>
+                    <div>
                       <button
                         type="button"
                         style={uploadButtonStyle}
