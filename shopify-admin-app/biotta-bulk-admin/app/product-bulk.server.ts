@@ -7,17 +7,47 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(APP_DIR, "../../..");
-const WORKER_SCRIPT_PATH = path.join(
-  REPO_ROOT,
-  "backend",
-  "product_bulk_worker.py",
-);
 const DEFAULT_PYTHON_COMMAND = "python3";
 const WORKER_API_VERSION = "2026-01";
 const XLSX_CONTENT_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const PRODUCT_JOB_TTL_MS = 30 * 60 * 1000;
+
+function looksLikeRepoRoot(candidatePath: string) {
+  return (
+    existsSync(path.join(candidatePath, "backend", "product_bulk_worker.py")) &&
+    existsSync(path.join(candidatePath, "Shopify Bulk Tool.py"))
+  );
+}
+
+function resolveRepoRoot() {
+  const configuredRoot = process.env.PRODUCT_BULK_REPO_ROOT?.trim();
+
+  const candidatePaths = [
+    configuredRoot,
+    path.resolve(process.cwd(), "../.."),
+    path.resolve(process.cwd(), ".."),
+    process.cwd(),
+    path.resolve(APP_DIR, "../../.."),
+    path.resolve(APP_DIR, "../../../.."),
+    path.resolve(APP_DIR, "../../../../.."),
+  ].filter((candidatePath): candidatePath is string => Boolean(candidatePath));
+
+  for (const candidatePath of candidatePaths) {
+    if (looksLikeRepoRoot(candidatePath)) {
+      return candidatePath;
+    }
+  }
+
+  return path.resolve(process.cwd(), "../..");
+}
+
+const REPO_ROOT = resolveRepoRoot();
+const WORKER_SCRIPT_PATH = path.join(
+  REPO_ROOT,
+  "backend",
+  "product_bulk_worker.py",
+);
 
 type BulkResource =
   | "products"
