@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { CSSProperties } from "react";
+import type { ChangeEvent, CSSProperties } from "react";
 import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { useRouteError } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
@@ -35,12 +35,6 @@ type BulkWorkflowState = {
   selectedFile: File | null;
 };
 type WorkflowState = Record<ModuleId, BulkWorkflowState>;
-type DropZoneElement = HTMLElement & {
-  files?: FileList | File[];
-};
-type DropZoneChangeEvent = Event & {
-  currentTarget: DropZoneElement;
-};
 type BulkWorkflowModule = {
   defaultDownloadFileName: string;
   defaultUploadFileName: string;
@@ -260,6 +254,103 @@ const moduleActionTitleStyle: CSSProperties = {
   margin: 0,
 };
 
+const pageShellStyle: CSSProperties = {
+  background:
+    "radial-gradient(circle at top left, rgba(59, 130, 246, 0.08), transparent 30%), linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%)",
+  minHeight: "100vh",
+  padding: "1.5rem",
+};
+
+const pageInnerStyle: CSSProperties = {
+  display: "grid",
+  gap: "1.5rem",
+  margin: "0 auto",
+  maxWidth: "1400px",
+};
+
+const pageHeadingStyle: CSSProperties = {
+  color: "#101828",
+  fontSize: "2rem",
+  lineHeight: 1.1,
+  margin: 0,
+};
+
+const pageSubheadingStyle: CSSProperties = {
+  color: "#475467",
+  fontSize: "1rem",
+  lineHeight: 1.6,
+  margin: 0,
+  maxWidth: "52rem",
+};
+
+const actionBodyStyle: CSSProperties = {
+  display: "grid",
+  gap: "0.75rem",
+};
+
+const bodyCopyStyle: CSSProperties = {
+  color: "#475467",
+  fontSize: "0.95rem",
+  lineHeight: 1.6,
+  margin: 0,
+};
+
+const inputLabelStyle: CSSProperties = {
+  color: "#344054",
+  fontSize: "0.875rem",
+  fontWeight: 600,
+  margin: 0,
+};
+
+const fileInputStyle: CSSProperties = {
+  background: "#ffffff",
+  border: "1px solid #d0d5dd",
+  borderRadius: "12px",
+  color: "#101828",
+  fontSize: "0.95rem",
+  padding: "0.875rem 1rem",
+  width: "100%",
+};
+
+const buttonRowStyle: CSSProperties = {
+  display: "flex",
+  flexWrap: "wrap",
+  gap: "0.75rem",
+};
+
+const primaryButtonStyle: CSSProperties = {
+  appearance: "none",
+  background: "#111827",
+  border: "1px solid #111827",
+  borderRadius: "999px",
+  color: "#ffffff",
+  cursor: "pointer",
+  fontSize: "0.95rem",
+  fontWeight: 600,
+  minHeight: "2.75rem",
+  padding: "0.75rem 1.25rem",
+};
+
+const secondaryButtonStyle: CSSProperties = {
+  appearance: "none",
+  background: "#ffffff",
+  border: "1px solid #d0d5dd",
+  borderRadius: "999px",
+  color: "#101828",
+  cursor: "pointer",
+  fontSize: "0.95rem",
+  fontWeight: 600,
+  minHeight: "2.75rem",
+  padding: "0.75rem 1.25rem",
+};
+
+const selectedFileStyle: CSSProperties = {
+  color: "#0f172a",
+  fontSize: "0.9rem",
+  lineHeight: 1.5,
+  margin: 0,
+};
+
 function createInitialWorkflowState(): WorkflowState {
   return {
     collections: {
@@ -471,11 +562,9 @@ export default function Index() {
 
   function handleFileSelection(
     moduleId: ModuleId,
-    event: DropZoneChangeEvent,
+    event: ChangeEvent<HTMLInputElement>,
   ) {
-    const files = Array.from(
-      (event.currentTarget.files ?? []) as ArrayLike<File>,
-    );
+    const files = Array.from(event.currentTarget.files ?? []);
     const file = files[0] ?? null;
 
     updateWorkflowState(moduleId, { selectedFile: file });
@@ -543,10 +632,25 @@ export default function Index() {
   }
 
   return (
-    <s-page heading="HUX Bulk Loader">
-      <div style={dashboardGridStyle}>
+    <div style={pageShellStyle}>
+      <div style={pageInnerStyle}>
+        <div style={moduleHeaderStyle}>
+          <h1 style={pageHeadingStyle}>HUX Bulk Loader</h1>
+          <p style={pageSubheadingStyle}>
+            Download the current Shopify workbook, make your edits offline, and
+            upload the revised spreadsheet when you are ready.
+          </p>
+        </div>
+
+        <div style={dashboardGridStyle}>
         {BULK_WORKFLOW_MODULES.map((module) => {
           const state = workflowState[module.id];
+          const actionButtonStyle = state.isDownloading
+            ? { ...secondaryButtonStyle, cursor: "wait", opacity: 0.7 }
+            : primaryButtonStyle;
+          const uploadButtonStyle = state.isUploading || !state.selectedFile
+            ? { ...secondaryButtonStyle, cursor: "not-allowed", opacity: 0.6 }
+            : primaryButtonStyle;
 
           return (
             <section key={module.id} style={moduleCardStyle}>
@@ -558,58 +662,72 @@ export default function Index() {
 
               <div style={moduleActionGridStyle}>
                 <div style={moduleActionCardStyle}>
-                  <s-stack direction="block" gap="base">
+                  <div style={actionBodyStyle}>
                     <p style={moduleActionLabelStyle}>Download</p>
                     <h3 style={moduleActionTitleStyle}>Current workbook</h3>
-                    <s-paragraph>{module.downloadDescription}</s-paragraph>
-                    <s-button
-                      variant="primary"
-                      onClick={() => handleDownload(module)}
-                      loading={state.isDownloading}
-                      disabled={state.isUploading}
-                    >
-                      {module.downloadButtonLabel}
-                    </s-button>
-                  </s-stack>
+                    <p style={bodyCopyStyle}>{module.downloadDescription}</p>
+                    <div style={buttonRowStyle}>
+                      <button
+                        type="button"
+                        style={actionButtonStyle}
+                        onClick={() => handleDownload(module)}
+                        disabled={state.isUploading || state.isDownloading}
+                      >
+                        {state.isDownloading
+                          ? "Working..."
+                          : module.downloadButtonLabel}
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
                 <div style={moduleActionCardStyle}>
-                  <s-stack direction="block" gap="base">
+                  <div style={actionBodyStyle}>
                     <p style={moduleActionLabelStyle}>Upload</p>
                     <h3 style={moduleActionTitleStyle}>Apply your edits</h3>
-                    <s-paragraph>{module.uploadDescription}</s-paragraph>
-                    <s-stack direction="block" gap="base">
-                      <s-drop-zone
-                        label={module.dropZoneLabel}
-                        name={`spreadsheet-${module.id}`}
+                    <p style={bodyCopyStyle}>{module.uploadDescription}</p>
+                    <label style={inputLabelStyle}>
+                      {module.dropZoneLabel}
+                      <input
+                        type="file"
                         accept=".xlsx"
                         onChange={(event) =>
                           handleFileSelection(module.id, event)
                         }
                         disabled={state.isUploading}
+                        style={fileInputStyle}
                       />
-                      {state.selectedFile ? (
-                        <s-paragraph>
-                          Selected file: {state.selectedFile.name}
-                        </s-paragraph>
-                      ) : null}
-                      <s-button
-                        variant="primary"
+                    </label>
+                    {state.selectedFile ? (
+                      <p style={selectedFileStyle}>
+                        Selected file: {state.selectedFile.name}
+                      </p>
+                    ) : null}
+                    <div style={buttonRowStyle}>
+                      <button
+                        type="button"
+                        style={uploadButtonStyle}
                         onClick={() => handleUpload(module)}
-                        loading={state.isUploading}
-                        disabled={!state.selectedFile || state.isDownloading}
+                        disabled={
+                          !state.selectedFile ||
+                          state.isDownloading ||
+                          state.isUploading
+                        }
                       >
-                        {module.uploadButtonLabel}
-                      </s-button>
-                    </s-stack>
-                  </s-stack>
+                        {state.isUploading
+                          ? "Working..."
+                          : module.uploadButtonLabel}
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </section>
           );
         })}
+        </div>
       </div>
-    </s-page>
+    </div>
   );
 }
 
