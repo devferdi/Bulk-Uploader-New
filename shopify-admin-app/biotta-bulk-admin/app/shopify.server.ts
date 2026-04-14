@@ -38,3 +38,80 @@ export const unauthenticated = shopify.unauthenticated;
 export const login = shopify.login;
 export const registerWebhooks = shopify.registerWebhooks;
 export const sessionStorage = shopify.sessionStorage;
+
+type AuthTraceDetails = {
+  hasAuthorizationHeader: boolean;
+  hasHost: boolean;
+  hasIdToken: boolean;
+  isEmbedded: boolean;
+  path: string;
+  routeId?: string;
+  searchKeys: string[];
+  shop: string | null;
+  userAgent: string;
+};
+
+function getAuthTraceDetails(request: Request, routeId?: string): AuthTraceDetails {
+  const url = new URL(request.url);
+  const userAgent = request.headers.get("user-agent") ?? "";
+
+  return {
+    routeId,
+    path: url.pathname,
+    searchKeys: Array.from(url.searchParams.keys()).sort(),
+    hasIdToken: url.searchParams.has("id_token"),
+    hasAuthorizationHeader: Boolean(request.headers.get("authorization")),
+    hasHost: Boolean(url.searchParams.get("host")),
+    isEmbedded: url.searchParams.get("embedded") === "1",
+    shop: url.searchParams.get("shop"),
+    userAgent: userAgent.slice(0, 180),
+  };
+}
+
+export async function authenticateAdminWithTrace(
+  request: Request,
+  routeId?: string,
+) {
+  const details = getAuthTraceDetails(request, routeId);
+  console.log("[auth-trace] start", JSON.stringify(details));
+
+  try {
+    const context = await authenticate.admin(request);
+    console.log(
+      "[auth-trace] success",
+      JSON.stringify({
+        routeId,
+        path: details.path,
+        hasIdToken: details.hasIdToken,
+        hasAuthorizationHeader: details.hasAuthorizationHeader,
+        shop: details.shop,
+      }),
+    );
+    return context;
+  } catch (error) {
+    if (error instanceof Response) {
+      console.log(
+        "[auth-trace] response",
+        JSON.stringify({
+          routeId,
+          path: details.path,
+          hasIdToken: details.hasIdToken,
+          hasAuthorizationHeader: details.hasAuthorizationHeader,
+          status: error.status,
+          statusText: error.statusText,
+          location: error.headers.get("location"),
+          shop: details.shop,
+        }),
+      );
+    } else {
+      console.error("[auth-trace] error", {
+        routeId,
+        path: details.path,
+        shop: details.shop,
+        error,
+      });
+    }
+
+    throw error;
+  }
+}
