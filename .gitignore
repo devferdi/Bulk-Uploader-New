@@ -3,3 +3,9 @@ credentials.txt
 __pycache__/
 backend/.env
 backend/*.db
+
+shopify_*.xlsx
+
+shopify-admin-app/biotta-bulk-admin/.cursor/
+shopify-admin-app/biotta-bulk-admin/.gemini/
+shopify-admin-app/biotta-bulk-admin/.mcp.json

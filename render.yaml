@@ -1,0 +1,27 @@
+services:
+  - type: web
+    runtime: docker
+    name: hux-bulk-loader
+    plan: starter
+    region: frankfurt
+    dockerfilePath: ./Dockerfile.shopify-admin-app
+    dockerContext: .
+    autoDeployTrigger: off
+    healthCheckPath: /healthz
+    envVars:
+      - key: SHOPIFY_API_KEY
+        sync: false
+      - key: SHOPIFY_API_SECRET
+        sync: false
+      - key: SCOPES
+        value: read_files,write_files,write_inventory,read_inventory,read_locations,read_metaobject_definitions,read_metaobjects,write_metaobjects,read_products,write_products
+      - key: DATABASE_URL
+        value: file:/var/data/dev.sqlite
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+    disk:
+      name: hux-bulk-loader-data
+      mountPath: /var/data
+      sizeGB: 1

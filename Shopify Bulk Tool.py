@@ -1,9 +1,15 @@
-import tkinter as tk
-from tkinter import messagebox, scrolledtext
+try:
+    import tkinter as tk
+    from tkinter import messagebox, scrolledtext
+    from tkinter import filedialog
+except ImportError:  # pragma: no cover - used for headless production workers
+    tk = None
+    messagebox = None
+    scrolledtext = None
+    filedialog = None
 import sys
 import io
 import threading
-from tkinter import filedialog
 import os
 import pandas as pd
 import concurrent.futures
@@ -13,6 +19,7 @@ import urllib.parse
 import unicodedata
 import os
 import time
+from datetime import datetime
 from openpyxl.styles import Font
 from openpyxl import Workbook, load_workbook
 import requests
@@ -25,6 +32,13 @@ from openai import OpenAI
 
 file_lock = threading.Lock()  # 🔒 Prevents simultaneous write conflicts
 DEFAULT_SHOPIFY_API_VERSION = "2026-01"
+
+
+def ensure_tkinter_available():
+    if tk is None or filedialog is None:
+        raise RuntimeError(
+            "This action requires tkinter, which is not available in this Python runtime."
+        )
 
 
 
@@ -556,22 +570,47 @@ def load_shopify_context(credentials_path):
     }
 
 
+def resolve_runtime_script_dir(script_dir=None):
+    if script_dir:
+        return os.path.abspath(script_dir)
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
-def run_downloader_logic():
-    # Get the directory where the executable or script is located
-    if getattr(sys, 'frozen', False):  # If running as an EXE
-        script_dir = os.path.dirname(sys.executable)
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Build the full path to 'credentials.txt'
+def build_shopify_context_from_values(shop_name, access_token, api_version=DEFAULT_SHOPIFY_API_VERSION):
+    shop_domain = normalize_shop_domain(shop_name)
+    resolved_shop_name = get_shop_name(shop_domain)
+    base_url, graphql_url = build_shopify_admin_urls(shop_domain, api_version)
+    granted_access_scopes = fetch_granted_access_scopes(shop_domain, access_token)
+
+    return {
+        "credentials": {},
+        "shop_domain": shop_domain,
+        "shop_name": resolved_shop_name,
+        "access_token": access_token,
+        "auth_method": "direct worker access_token",
+        "auth_errors": [],
+        "granted_access_scopes": granted_access_scopes,
+        "api_version": api_version,
+        "base_url": base_url,
+        "graphql_url": graphql_url,
+    }
+
+
+def run_downloader_logic(shopify_context=None, script_dir=None, output_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
     credentials_path = os.path.join(script_dir, 'credentials.txt')
 
-    shopify_context = load_shopify_context(credentials_path)
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
     granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
-    log_shopify_access_scope_diagnostics(shopify_context)
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=["read_products", "read_locations", "read_inventory", "read_metaobjects"],
+    )
 
     # Shopify API URL
     BASE_URL = shopify_context["base_url"]
@@ -725,6 +764,7 @@ def run_downloader_logic():
         
         if response.status_code == 200:
             return response.json().get('locations', [])
+        print(f"Warning: could not fetch Shopify locations ({response.status_code}).")
         return []
 
     # Fetch inventory levels for a specific variant at a location
@@ -1092,9 +1132,15 @@ def run_downloader_logic():
             if key not in df.columns:
                 df[key] = None
 
+        resolved_output_dir = os.path.abspath(output_dir or script_dir)
+        os.makedirs(resolved_output_dir, exist_ok=True)
+
         # Get the current date and time to append to the filename
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_path = f"shopify_products_bulk_{current_time}.xlsx"
+        file_path = os.path.join(
+            resolved_output_dir,
+            f"shopify_products_bulk_{current_time}.xlsx"
+        )
 
         # Save to Excel
         df.to_excel(file_path, index=False)
@@ -1117,33 +1163,48 @@ def run_downloader_logic():
         wb.save(file_path)
 
         print("Data has been saved successfully.")
+        return file_path
 
     # Example usage
     products = get_all_products()
     locations = get_locations()
-    if products and locations:
-        save_to_excel(products, locations)
+    if products:
+        if not locations:
+            print(
+                "Warning: no Shopify locations were returned. "
+                "The spreadsheet will still be generated, but location inventory columns will be omitted."
+            )
+        saved_file_path = save_to_excel(products, locations)
+        print(f"Data has been saved to {saved_file_path}.")
+        return saved_file_path
 
-    print(f"Data has been saved.")
+    print("No products were returned from Shopify.")
+    return None
 
-def run_uploader_logic():
-    # Get the directory where the executable or script is located
-    if getattr(sys, 'frozen', False):  # If running as an EXE
-        script_dir = os.path.dirname(sys.executable)
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Build the full path to 'credentials.txt'
+def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
     credentials_path = os.path.join(script_dir, 'credentials.txt')
 
-    shopify_context = load_shopify_context(credentials_path)
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
     log_shopify_access_scope_diagnostics(
         shopify_context,
-        required_scopes=["read_metaobjects", "read_metaobject_definitions"],
+        required_scopes=[
+            "read_products",
+            "write_products",
+            "read_metaobjects",
+            "read_metaobject_definitions",
+            "read_files",
+            "write_files",
+            "read_locations",
+            "read_inventory",
+        ],
     )
     granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
+    can_read_files = not granted_access_scopes or "read_files" in granted_access_scopes
+    can_write_files = not granted_access_scopes or "write_files" in granted_access_scopes
 
     # Shopify API URLs
     BASE_URL = shopify_context["base_url"]
@@ -2588,6 +2649,13 @@ def run_uploader_logic():
 
     # Function to create a staged upload
     def staged_upload_create(filename, mime_type):
+        if not can_write_files:
+            print(
+                "⚠️ Current Shopify token does not include `write_files`, "
+                "so new files cannot be uploaded from this spreadsheet."
+            )
+            return None
+
         query = """
         mutation {
         stagedUploadsCreate(input: {
@@ -2638,6 +2706,13 @@ def run_uploader_logic():
 
     # Function to commit the file with fileCreate
     def commit_file_to_shopify(file_name, original_source):
+        if not can_write_files:
+            print(
+                "⚠️ Current Shopify token does not include `write_files`, "
+                f"so file '{file_name}' cannot be committed to Shopify."
+            )
+            return None
+
         query = """
         mutation fileCreate($files: [FileCreateInput!]!) {
         fileCreate(files: $files) {
@@ -2776,6 +2851,14 @@ def run_uploader_logic():
         has_next_page = True
         cursor = None
 
+        if not can_read_files:
+            print(
+                "⚠️ Current Shopify token does not include `read_files`, "
+                "so existing Shopify files cannot be looked up. File-reference "
+                "fields will only work with raw GIDs that are already in the sheet."
+            )
+            return all_files
+
         while has_next_page:
             query = f"""
             {{
@@ -2804,8 +2887,16 @@ def run_uploader_logic():
             response = requests.post(GRAPHQL_URL, json={"query": query}, headers=graphql_headers)
             if response.status_code == 200:
                 data = response.json()
-                if "data" in data and "files" in data["data"]:
-                    for file in data["data"]["files"]["edges"]:
+                payload = (data or {}).get("data") or {}
+                files_connection = payload.get("files") or {}
+                errors = data.get("errors") or []
+
+                if errors:
+                    print(f"Error fetching files: {errors}")
+                    return all_files
+
+                if files_connection:
+                    for file in files_connection.get("edges") or []:
                         node = file["node"]
                         gid = node["id"]
                         alt = node["alt"]
@@ -2821,13 +2912,13 @@ def run_uploader_logic():
                             remember_file_reference(all_files, filename, gid, url)
                         cursor = file["cursor"]
 
-                    has_next_page = data["data"]["files"]["pageInfo"]["hasNextPage"]
+                    has_next_page = bool((files_connection.get("pageInfo") or {}).get("hasNextPage"))
                 else:
-                    print("No files found or error in response.")
-                    return None
+                    print("No files found or file lookup was unavailable in the Shopify response.")
+                    return all_files
             else:
                 print(f"Error fetching files. Status code: {response.status_code}")
-                return None
+                return all_files
 
         return all_files
 
@@ -4388,9 +4479,11 @@ def run_uploader_logic():
         # After processing all rows, save the updated DataFrame back to Excel
         df.to_excel(file_path, index=False)
         print("Spreadsheet updated with new image URLs.")
+        return file_path
 
     # Function to prompt the user to select a file
     def get_file_path():
+        ensure_tkinter_available()
         root = tk.Tk()
         root.withdraw()  # Hide the main window
         file_path = filedialog.askopenfilename(
@@ -4400,28 +4493,29 @@ def run_uploader_logic():
         return file_path
 
     # Example usage
-    file_path = get_file_path()
+    file_path = file_path or get_file_path()
     if file_path:
-        upload_changes_from_spreadsheet(file_path)
-    else:
-        print("No file selected.")# Function to run the downloader logic
+        return upload_changes_from_spreadsheet(file_path)
+
+    print("No file selected.")
+    return None
+
+# Function to run the downloader logic
 
 
 
-def collection_run_downloader_logic():
-    # Get the directory where the executable or script is located
-    if getattr(sys, 'frozen', False):  # If running as an EXE
-        script_dir = os.path.dirname(sys.executable)
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # Build the full path to 'credentials.txt'
+def collection_run_downloader_logic(shopify_context=None, script_dir=None, output_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
     credentials_path = os.path.join(script_dir, 'credentials.txt')
 
-    shopify_context = load_shopify_context(credentials_path)
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
-    log_shopify_access_scope_diagnostics(shopify_context)
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=["read_products"],
+    )
 
     # Shopify API URL
     BASE_URL = shopify_context["base_url"]
@@ -4534,8 +4628,14 @@ def collection_run_downloader_logic():
             if key not in df.columns:
                 df[key] = None
                 
+        resolved_output_dir = os.path.abspath(output_dir or script_dir)
+        os.makedirs(resolved_output_dir, exist_ok=True)
+
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_path = f"shopify_collections_{current_time}.xlsx"
+        file_path = os.path.join(
+            resolved_output_dir,
+            f"shopify_collections_{current_time}.xlsx"
+        )
 
         df.to_excel(file_path, index=False)
         
@@ -4550,6 +4650,7 @@ def collection_run_downloader_logic():
         wb.save(file_path)
         
         print("Data has been saved successfully.")
+        return file_path
 
     print("Fetching collections...")
     collections = collection_fetch_all()
@@ -4569,22 +4670,22 @@ def collection_run_downloader_logic():
             collection_products.append([col_id, prod])
     
     print("Saving data to Excel...")
-    collection_save_to_excel(collections, metafields_data, collection_products)
+    file_path = collection_save_to_excel(collections, metafields_data, collection_products)
     print("Collection download completed.")
+    return file_path
 
-def collection_run_uploader_logic():
-    # Get script directory
-    if getattr(sys, 'frozen', False):
-        script_dir = os.path.dirname(sys.executable)
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+def collection_run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
 
-    # Load credentials
     credentials_path = os.path.join(script_dir, 'credentials.txt')
-    shopify_context = load_shopify_context(credentials_path)
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
-    log_shopify_access_scope_diagnostics(shopify_context)
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=["read_products", "write_products", "read_files", "write_files"],
+    )
 
     # Shopify API URLs
     BASE_URL = shopify_context["base_url"]
@@ -5189,7 +5290,9 @@ def collection_run_uploader_logic():
             else:
                 print(f"❌ Failed to create collection: {title}")
 
-    print("🎉 Collections upload completed.")
+        df.to_excel(file_path, index=False)
+        print("🎉 Collections upload completed.")
+        return file_path
 
     def update_collection(collection_id, collection_data, is_smart=False):
         url = f"{BASE_URL}/smart_collections/{collection_id}.json" if is_smart else f"{BASE_URL}/custom_collections/{collection_id}.json"
@@ -5219,15 +5322,1388 @@ def collection_run_uploader_logic():
 
 
     def get_file_path():
+        ensure_tkinter_available()
         root = tk.Tk()
         root.withdraw()
         return filedialog.askopenfilename(title="Select Excel File", filetypes=[("Excel files", "*.xlsx")])
 
-    file_path = get_file_path()
+    file_path = file_path or get_file_path()
     if file_path:
-        upload_collections_from_file(file_path)
+        return upload_collections_from_file(file_path)
+
+    print("❌ No file selected.")
+    return None
+
+
+def metaobject_run_downloader_logic(shopify_context=None, script_dir=None, output_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
+
+    credentials_path = os.path.join(script_dir, 'credentials.txt')
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
+    ACCESS_TOKEN = shopify_context["access_token"]
+    GRAPHQL_URL = shopify_context["graphql_url"]
+    granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
+
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=["read_metaobjects", "read_metaobject_definitions"],
+    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": ACCESS_TOKEN
+    }
+
+    metaobject_label_cache = {}
+    warned_missing_metaobject_scope = False
+
+    def _graphql_post(query, variables=None, purpose="(unspecified)"):
+        payload = {"query": query, "variables": variables or {}}
+        try:
+            response = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as exc:
+            print(f"❌ GraphQL {purpose} request failed: {exc}")
+            return None
+        except ValueError as exc:
+            print(f"❌ GraphQL {purpose} returned invalid JSON: {exc}")
+            return None
+
+        if data.get("errors"):
+            print(f"❌ GraphQL {purpose} errors: {data['errors']}")
+        return data
+
+    def parse_metaobject_reference_values(value):
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        try:
+            if pd.isna(value):
+                return []
+        except TypeError:
+            pass
+
+        raw_value = str(value).strip()
+        if not raw_value:
+            return []
+
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+
+        return [item.strip() for item in re.split(r"[\n,;]+", raw_value) if item.strip()]
+
+    def get_metaobject_display_label(metaobject_gid):
+        nonlocal warned_missing_metaobject_scope
+
+        if not metaobject_gid:
+            return metaobject_gid
+
+        if metaobject_gid in metaobject_label_cache:
+            return metaobject_label_cache[metaobject_gid]
+
+        if granted_access_scopes and "read_metaobjects" not in granted_access_scopes:
+            if not warned_missing_metaobject_scope:
+                print(
+                    "⚠️ Current Shopify token does not include `read_metaobjects`, "
+                    "so metaobject references will be exported as raw GIDs."
+                )
+                warned_missing_metaobject_scope = True
+            metaobject_label_cache[metaobject_gid] = metaobject_gid
+            return metaobject_gid
+
+        query = """
+        query MetaobjectNode($id: ID!) {
+          node(id: $id) {
+            ... on Metaobject {
+              id
+              displayName
+              handle
+              fields {
+                key
+                value
+              }
+            }
+          }
+        }
+        """
+        data = _graphql_post(
+            query,
+            {"id": metaobject_gid},
+            purpose=f"Metaobject label lookup for {metaobject_gid}",
+        )
+        node = (((data or {}).get("data") or {}).get("node") or {})
+
+        label_candidates = [
+            node.get("displayName"),
+            next(
+                (
+                    field.get("value")
+                    for field in (node.get("fields") or [])
+                    if (field.get("key") or "").strip().lower() in {"title", "name", "label"}
+                    and field.get("value")
+                ),
+                None,
+            ),
+            node.get("handle"),
+        ]
+        resolved_label = next((candidate for candidate in label_candidates if candidate), metaobject_gid)
+        metaobject_label_cache[metaobject_gid] = resolved_label
+        return resolved_label
+
+    def resolve_downloaded_field_value(field):
+        field_type = (field.get("type") or "").strip().lower()
+        raw_value = field.get("value")
+
+        if raw_value in (None, ""):
+            return raw_value
+
+        if field_type == "metaobject_reference":
+            return get_metaobject_display_label(str(raw_value).strip())
+
+        if field_type == "list.metaobject_reference":
+            resolved_values = [
+                get_metaobject_display_label(item)
+                for item in parse_metaobject_reference_values(raw_value)
+            ]
+            resolved_values = [value for value in resolved_values if value]
+            return ", ".join(resolved_values) if resolved_values else raw_value
+
+        return raw_value
+
+    def extract_field_type_name(field_definition):
+        field_type = field_definition.get("type")
+        if isinstance(field_type, dict):
+            return (field_type.get("name") or "").strip()
+        return str(field_type or "").strip()
+
+    def fetch_all_metaobject_definitions():
+        query = """
+        query MetaobjectDefinitions($after: String) {
+          metaobjectDefinitions(first: 250, after: $after) {
+            nodes {
+              id
+              name
+              type
+              displayNameKey
+              capabilities {
+                publishable {
+                  enabled
+                }
+              }
+              fieldDefinitions {
+                key
+                name
+                required
+                type {
+                  name
+                }
+                validations {
+                  name
+                  value
+                }
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        definitions = []
+        cursor = None
+        has_next_page = True
+
+        while has_next_page:
+            data = _graphql_post(
+                query,
+                {"after": cursor},
+                purpose="Metaobject definitions export",
+            )
+            connection = (((data or {}).get("data") or {}).get("metaobjectDefinitions") or {})
+            nodes = connection.get("nodes") or []
+
+            for node in nodes:
+                field_definitions = []
+                for field_definition in node.get("fieldDefinitions") or []:
+                    field_definitions.append(
+                        {
+                            "key": field_definition.get("key") or "",
+                            "name": field_definition.get("name") or "",
+                            "required": bool(field_definition.get("required")),
+                            "type": extract_field_type_name(field_definition),
+                            "validations": field_definition.get("validations") or [],
+                        }
+                    )
+
+                definitions.append(
+                    {
+                        "id": node.get("id"),
+                        "name": node.get("name") or "",
+                        "type": node.get("type") or "",
+                        "display_name_key": node.get("displayNameKey") or "",
+                        "publishable_enabled": bool(
+                            ((((node.get("capabilities") or {}).get("publishable") or {}).get("enabled")))
+                        ),
+                        "field_definitions": field_definitions,
+                    }
+                )
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        definitions.sort(key=lambda definition: ((definition.get("name") or "").casefold(), definition.get("type") or ""))
+        return definitions
+
+    def fetch_metaobjects_for_type(metaobject_type):
+        query = """
+        query MetaobjectsByType($type: String!, $after: String) {
+          metaobjects(type: $type, first: 250, after: $after) {
+            nodes {
+              id
+              type
+              handle
+              displayName
+              updatedAt
+              capabilities {
+                publishable {
+                  status
+                }
+              }
+              fields {
+                key
+                type
+                value
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        metaobjects = []
+        cursor = None
+        has_next_page = True
+
+        while has_next_page:
+            data = _graphql_post(
+                query,
+                {"type": metaobject_type, "after": cursor},
+                purpose=f"Metaobjects export for type {metaobject_type}",
+            )
+            connection = (((data or {}).get("data") or {}).get("metaobjects") or {})
+            metaobjects.extend(connection.get("nodes") or [])
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        return metaobjects
+
+    base_columns = [
+        "ID",
+        "Type",
+        "Definition Name",
+        "Handle",
+        "Display Name",
+        "Display Name Field",
+        "Publish Status",
+        "Updated At",
+    ]
+
+    definitions = fetch_all_metaobject_definitions()
+    if not definitions:
+        print(
+            "⚠️ No metaobject definitions were returned by Shopify. "
+            "An empty metaobjects spreadsheet will be generated."
+        )
     else:
+        print(f"Found {len(definitions)} metaobject definitions.")
+
+    rows = []
+    all_field_columns = set()
+
+    for definition in definitions:
+        metaobject_type = definition["type"]
+        definition_name = definition["name"]
+        display_name_key = definition["display_name_key"]
+        metaobjects = fetch_metaobjects_for_type(metaobject_type)
+
+        print(
+            f"Exporting {len(metaobjects)} metaobjects for definition "
+            f"'{definition_name}' ({metaobject_type})..."
+        )
+
+        for field_definition in definition["field_definitions"]:
+            column_name = f"Field: {field_definition['key']} [{field_definition['type'] or 'unknown'}]"
+            all_field_columns.add(column_name)
+
+        for metaobject in metaobjects:
+            row = {
+                "ID": metaobject.get("id") or "",
+                "Type": metaobject.get("type") or metaobject_type,
+                "Definition Name": definition_name,
+                "Handle": metaobject.get("handle") or "",
+                "Display Name": metaobject.get("displayName") or "",
+                "Display Name Field": display_name_key,
+                "Publish Status": (
+                    ((((metaobject.get("capabilities") or {}).get("publishable") or {}).get("status")))
+                    if definition.get("publishable_enabled")
+                    else ""
+                ),
+                "Updated At": metaobject.get("updatedAt") or "",
+            }
+
+            for field in metaobject.get("fields") or []:
+                field_key = field.get("key") or ""
+                field_type = field.get("type") or "unknown"
+                column_name = f"Field: {field_key} [{field_type}]"
+                all_field_columns.add(column_name)
+                row[column_name] = resolve_downloaded_field_value(field)
+
+            rows.append(row)
+
+    ordered_field_columns = sorted(all_field_columns, key=str.casefold)
+    if rows:
+        df = pd.DataFrame(rows)
+    else:
+        df = pd.DataFrame(columns=base_columns + ordered_field_columns)
+
+    for column_name in base_columns + ordered_field_columns:
+        if column_name not in df.columns:
+            df[column_name] = None
+
+    df = df[base_columns + ordered_field_columns]
+
+    resolved_output_dir = os.path.abspath(output_dir or script_dir)
+    os.makedirs(resolved_output_dir, exist_ok=True)
+
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_path = os.path.join(
+        resolved_output_dir,
+        f"shopify_metaobjects_{current_time}.xlsx"
+    )
+    df.to_excel(file_path, index=False)
+
+    wb = load_workbook(file_path)
+    ws = wb.active
+    ws.title = "Metaobjects"
+
+    bold_font = Font(bold=True)
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        if row[0].value:
+            for cell in row:
+                cell.font = bold_font
+
+    ws.freeze_panes = ws['B2']
+    wb.save(file_path)
+
+    print(f"✅ Metaobjects exported to {file_path}")
+    return file_path
+
+
+def metaobject_run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
+
+    credentials_path = os.path.join(script_dir, 'credentials.txt')
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
+    ACCESS_TOKEN = shopify_context["access_token"]
+    GRAPHQL_URL = shopify_context["graphql_url"]
+
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=[
+            "read_metaobjects",
+            "read_metaobject_definitions",
+            "write_metaobjects",
+            "read_files",
+            "write_files",
+        ],
+    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": ACCESS_TOKEN
+    }
+    graphql_headers = headers.copy()
+
+    image_folder = os.path.join(script_dir, 'img')
+    file_folder = os.path.join(script_dir, 'files')
+
+    asset_directories = []
+    for candidate in [image_folder, file_folder, script_dir]:
+        if candidate and candidate not in asset_directories:
+            asset_directories.append(candidate)
+
+    import xml.etree.ElementTree as ET
+
+    skip_field = object()
+    metaobject_definition_cache = {}
+    metaobject_definition_type_cache = {}
+    metaobject_lookup_cache = {}
+
+    def _graphql_post(query, variables=None, purpose="(unspecified)"):
+        payload = {"query": query, "variables": variables or {}}
+        try:
+            response = requests.post(GRAPHQL_URL, headers=graphql_headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as exc:
+            print(f"❌ GraphQL {purpose} request failed: {exc}")
+            return None
+        except ValueError as exc:
+            print(f"❌ GraphQL {purpose} returned invalid JSON: {exc}")
+            return None
+
+        if data.get("errors"):
+            print(f"❌ GraphQL {purpose} errors: {data['errors']}")
+        return data
+
+    def resolve_local_asset_path(filename):
+        return resolve_asset_from_directories(filename, asset_directories)
+
+    def normalize_metaobject_lookup_value(value):
+        if value is None:
+            return ""
+        return re.sub(r"\s+", " ", str(value)).strip().casefold()
+
+    def parse_metaobject_reference_values(value):
+        if value is None:
+            return []
+
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        try:
+            if pd.isna(value):
+                return []
+        except TypeError:
+            pass
+
+        raw_value = str(value).strip()
+        if not raw_value:
+            return []
+
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+
+        return [item.strip() for item in re.split(r"[\n,;]+", raw_value) if item.strip()]
+
+    def parse_generic_list_value(value):
+        if value is None:
+            return []
+
+        if isinstance(value, (list, tuple, set)):
+            return list(value)
+
+        try:
+            if pd.isna(value):
+                return []
+        except TypeError:
+            pass
+
+        raw_value = str(value).strip()
+        if not raw_value:
+            return []
+
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return parsed
+
+        return [item.strip() for item in re.split(r"[\n,;]+", raw_value) if item.strip()]
+
+    def add_metaobject_lookup_candidate(lookup, raw_value, entry):
+        normalized_value = normalize_metaobject_lookup_value(raw_value)
+        if not normalized_value:
+            return
+
+        matches = lookup.setdefault(normalized_value, [])
+        if all(existing["id"] != entry["id"] for existing in matches):
+            matches.append(entry)
+
+    def extract_definition_type_name(field_definition):
+        field_type = field_definition.get("type")
+        if isinstance(field_type, dict):
+            return (field_type.get("name") or "").strip()
+        return str(field_type or "").strip()
+
+    def get_metaobject_definition_type_from_gid(definition_gid):
+        if definition_gid in metaobject_definition_type_cache:
+            return metaobject_definition_type_cache[definition_gid]
+
+        query = """
+        query MetaobjectDefinitionById($id: ID!) {
+          node(id: $id) {
+            ... on MetaobjectDefinition {
+              id
+              type
+            }
+          }
+        }
+        """
+        data = _graphql_post(
+            query,
+            {"id": definition_gid},
+            purpose=f"Metaobject definition lookup for {definition_gid}",
+        )
+        definition_type = ((((data or {}).get("data") or {}).get("node") or {}).get("type"))
+        metaobject_definition_type_cache[definition_gid] = definition_type
+        return definition_type
+
+    def get_metaobject_definition(metaobject_type):
+        if metaobject_type in metaobject_definition_cache:
+            return metaobject_definition_cache[metaobject_type]
+
+        query = """
+        query MetaobjectDefinitionByType($type: String!) {
+          metaobjectDefinitionByType(type: $type) {
+            id
+            name
+            type
+            displayNameKey
+            capabilities {
+              publishable {
+                enabled
+              }
+            }
+            fieldDefinitions {
+              key
+              name
+              required
+              type {
+                name
+              }
+              validations {
+                name
+                value
+              }
+            }
+          }
+        }
+        """
+        data = _graphql_post(
+            query,
+            {"type": metaobject_type},
+            purpose=f"Metaobject definition fetch for {metaobject_type}",
+        )
+        node = (((data or {}).get("data") or {}).get("metaobjectDefinitionByType") or {})
+        if not node:
+            print(f"❌ Could not load metaobject definition for type '{metaobject_type}'.")
+            metaobject_definition_cache[metaobject_type] = None
+            return None
+
+        field_definitions = []
+        fields_by_key = {}
+        for field_definition in node.get("fieldDefinitions") or []:
+            normalized_definition = {
+                "key": field_definition.get("key") or "",
+                "name": field_definition.get("name") or "",
+                "required": bool(field_definition.get("required")),
+                "type": extract_definition_type_name(field_definition),
+                "validations": field_definition.get("validations") or [],
+            }
+            field_definitions.append(normalized_definition)
+            fields_by_key[normalized_definition["key"]] = normalized_definition
+
+        definition = {
+            "id": node.get("id"),
+            "name": node.get("name") or "",
+            "type": node.get("type") or metaobject_type,
+            "display_name_key": node.get("displayNameKey") or "",
+            "publishable_enabled": bool(
+                ((((node.get("capabilities") or {}).get("publishable") or {}).get("enabled")))
+            ),
+            "field_definitions": field_definitions,
+            "fields_by_key": fields_by_key,
+        }
+        metaobject_definition_cache[metaobject_type] = definition
+        return definition
+
+    def get_metaobject_lookup(metaobject_type):
+        if metaobject_type in metaobject_lookup_cache:
+            return metaobject_lookup_cache[metaobject_type]
+
+        query = """
+        query MetaobjectsByType($type: String!, $after: String) {
+          metaobjects(type: $type, first: 250, after: $after) {
+            nodes {
+              id
+              displayName
+              handle
+              fields {
+                key
+                value
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        lookup = {}
+        cursor = None
+        has_next_page = True
+
+        while has_next_page:
+            data = _graphql_post(
+                query,
+                {"type": metaobject_type, "after": cursor},
+                purpose=f"Metaobjects lookup for type {metaobject_type}",
+            )
+            connection = (((data or {}).get("data") or {}).get("metaobjects") or {})
+            nodes = connection.get("nodes") or []
+
+            for node in nodes:
+                metaobject_id = node.get("id")
+                if not metaobject_id:
+                    continue
+
+                entry = {
+                    "id": metaobject_id,
+                    "display_name": node.get("displayName") or "",
+                    "handle": node.get("handle") or "",
+                }
+                add_metaobject_lookup_candidate(lookup, entry["display_name"], entry)
+                add_metaobject_lookup_candidate(lookup, entry["handle"], entry)
+
+                for field in node.get("fields") or []:
+                    field_key = (field.get("key") or "").strip().lower()
+                    field_value = field.get("value")
+                    if field_key in {"title", "name", "label"} and field_value:
+                        add_metaobject_lookup_candidate(lookup, field_value, entry)
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        metaobject_lookup_cache[metaobject_type] = lookup
+        return lookup
+
+    def get_target_metaobject_type(field_definition):
+        definition_gid = None
+        metaobject_type = None
+
+        for validation in field_definition.get("validations") or []:
+            validation_name = (validation.get("name") or "").strip().lower()
+            if "metaobject_definition" not in validation_name:
+                continue
+
+            for candidate in parse_metaobject_reference_values(validation.get("value")):
+                if candidate.startswith("gid://shopify/MetaobjectDefinition/"):
+                    definition_gid = candidate
+                    break
+                if candidate and not metaobject_type:
+                    metaobject_type = candidate
+
+            if definition_gid:
+                break
+
+        if definition_gid and not metaobject_type:
+            metaobject_type = get_metaobject_definition_type_from_gid(definition_gid)
+
+        return metaobject_type
+
+    def resolve_metaobject_reference_gid(field_definition, raw_value):
+        if isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+
+        if not raw_value:
+            return None
+
+        if isinstance(raw_value, str) and raw_value.startswith("gid://shopify/Metaobject/"):
+            return raw_value
+
+        target_metaobject_type = get_target_metaobject_type(field_definition)
+        if not target_metaobject_type:
+            print(
+                f"❌ Could not determine which metaobject type field "
+                f"'{field_definition.get('key')}' references."
+            )
+            return None
+
+        lookup = get_metaobject_lookup(target_metaobject_type)
+        matches = lookup.get(normalize_metaobject_lookup_value(raw_value), [])
+
+        if len(matches) == 1:
+            return matches[0]["id"]
+
+        if len(matches) > 1:
+            options = ", ".join(
+                match.get("display_name") or match.get("handle") or match.get("id")
+                for match in matches
+            )
+            print(
+                f"❌ Metaobject value '{raw_value}' is ambiguous for field "
+                f"'{field_definition.get('key')}'. Matches: {options}"
+            )
+            return None
+
+        print(
+            f"❌ Could not resolve metaobject value '{raw_value}' for field "
+            f"'{field_definition.get('key')}'. Expected type '{target_metaobject_type}'."
+        )
+        return None
+
+    def staged_upload_create(filename, mime_type):
+        query = """
+        mutation StagedUploadCreate($input: [StagedUploadInput!]!) {
+          stagedUploadsCreate(input: $input) {
+            stagedTargets {
+              url
+              parameters {
+                name
+                value
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        variables = {
+            "input": [
+                {
+                    "resource": "FILE",
+                    "filename": filename,
+                    "mimeType": mime_type,
+                    "httpMethod": "POST",
+                }
+            ]
+        }
+        data = _graphql_post(query, variables, purpose=f"Staged upload for {filename}")
+        payload = (((data or {}).get("data") or {}).get("stagedUploadsCreate") or {})
+        user_errors = payload.get("userErrors") or []
+        if user_errors:
+            print(f"❌ Staged upload creation failed for {filename}: {user_errors}")
+            return None
+
+        staged_targets = payload.get("stagedTargets") or []
+        return staged_targets[0] if staged_targets else None
+
+    def upload_file_to_staging(staging_target, file_path):
+        url = staging_target["url"]
+        form_data = {param["name"]: param["value"] for param in staging_target["parameters"]}
+        try:
+            with open(file_path, "rb") as file_handle:
+                response = requests.post(url, data=form_data, files={"file": file_handle})
+        except OSError as exc:
+            print(f"❌ Failed to read file '{file_path}' for staged upload: {exc}")
+            return None
+        except requests.RequestException as exc:
+            print(f"❌ Failed to upload '{file_path}' to the staged URL: {exc}")
+            return None
+
+        if response.status_code == 201:
+            try:
+                xml_response = ET.fromstring(response.text)
+                location_node = xml_response.find('Location')
+                return location_node.text if location_node is not None else None
+            except ET.ParseError as exc:
+                print(f"❌ Could not parse staged upload response for '{file_path}': {exc}")
+                return None
+
+        print(f"❌ Failed to upload '{file_path}' to staging. Status: {response.status_code}, {response.text}")
+        return None
+
+    def commit_file_to_shopify(file_name, original_source):
+        query = """
+        mutation FileCreate($files: [FileCreateInput!]!) {
+          fileCreate(files: $files) {
+            files {
+              id
+              alt
+              ... on GenericFile {
+                url
+              }
+              ... on MediaImage {
+                image {
+                  url
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        variables = {
+            "files": [
+                {
+                    "alt": file_name,
+                    "originalSource": original_source
+                }
+            ]
+        }
+        data = _graphql_post(query, variables, purpose=f"fileCreate for {file_name}")
+        payload = (((data or {}).get("data") or {}).get("fileCreate") or {})
+        user_errors = payload.get("userErrors") or []
+        if user_errors:
+            print(f"❌ fileCreate failed for {file_name}: {user_errors}")
+            return None
+
+        files = payload.get("files") or []
+        return files[0] if files else None
+
+    def get_image_url_for_gid(gid):
+        query = """
+        query FileNode($id: ID!) {
+          node(id: $id) {
+            ... on GenericFile {
+              url
+            }
+            ... on MediaImage {
+              image {
+                url
+              }
+            }
+          }
+        }
+        """
+        data = _graphql_post(query, {"id": gid}, purpose=f"File URL lookup for {gid}")
+        node = (((data or {}).get("data") or {}).get("node") or {})
+        if node.get("url"):
+            return node.get("url")
+        image = node.get("image") or {}
+        return image.get("url")
+
+    def upload_file_to_shopify(file_path):
+        filename = os.path.basename(file_path)
+        normalized_filename = normalize_filename(filename)
+        normalized_path = os.path.join(os.path.dirname(file_path), normalized_filename)
+
+        if not os.path.exists(normalized_path):
+            print(f"❌ File '{normalized_filename}' was not found.")
+            return None, None
+
+        mime_type = guess_mime_type(filename)
+        staged_target = staged_upload_create(filename, mime_type)
+        if not staged_target:
+            return None, None
+
+        location_url = upload_file_to_staging(staged_target, normalized_path)
+        if not location_url:
+            return None, None
+
+        file_info = commit_file_to_shopify(filename, location_url)
+        if not file_info:
+            return None, None
+
+        gid = file_info.get("id")
+        url = file_info.get("url")
+        if not url and file_info.get("image"):
+            url = (file_info.get("image") or {}).get("url")
+        if not url and gid:
+            url = get_image_url_for_gid(gid)
+        return url, gid
+
+    def get_all_files():
+        all_files = {}
+        query = """
+        query Files($after: String) {
+          files(first: 250, after: $after) {
+            edges {
+              node {
+                id
+                alt
+                ... on GenericFile {
+                  url
+                }
+                ... on MediaImage {
+                  image {
+                    url
+                  }
+                }
+              }
+              cursor
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        cursor = None
+        has_next_page = True
+
+        while has_next_page:
+            data = _graphql_post(query, {"after": cursor}, purpose="Shopify files lookup")
+            connection = (((data or {}).get("data") or {}).get("files") or {})
+            for edge in connection.get("edges") or []:
+                node = edge.get("node") or {}
+                gid = node.get("id")
+                alt = node.get("alt")
+                url = node.get("url") or ((node.get("image") or {}).get("url"))
+                if alt:
+                    remember_file_reference(all_files, alt, gid, url)
+                filename = extract_filename_from_value(url)
+                if filename:
+                    remember_file_reference(all_files, filename, gid, url)
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        return all_files
+
+    def has_cell_value(value):
+        if value is None:
+            return False
+        try:
+            if pd.isna(value):
+                return False
+        except TypeError:
+            pass
+        if isinstance(value, str):
+            return bool(value.strip())
+        return True
+
+    def normalize_scalar_value(field_type, value):
+        if isinstance(value, pd.Timestamp):
+            if field_type == "date":
+                return value.date().isoformat()
+            if field_type == "date_time":
+                return value.to_pydatetime().isoformat()
+            if field_type == "time":
+                return value.strftime("%H:%M:%S")
+            value = value.to_pydatetime()
+
+        if isinstance(value, datetime):
+            if field_type == "date":
+                return value.date().isoformat()
+            if field_type == "date_time":
+                return value.isoformat()
+            if field_type == "time":
+                return value.strftime("%H:%M:%S")
+
+        if field_type == "boolean":
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            normalized_value = str(value).strip().lower()
+            if normalized_value in {"1", "true", "yes", "y"}:
+                return "true"
+            if normalized_value in {"0", "false", "no", "n"}:
+                return "false"
+            return normalized_value
+
+        if field_type in {"single_line_text_field", "multi_line_text_field"}:
+            return format_metafield_text_value(value)
+
+        if isinstance(value, bool):
+            return "true" if value else "false"
+
+        if isinstance(value, numbers.Number):
+            return format_metafield_text_value(value)
+
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+
+        return str(value).strip()
+
+    def resolve_field_value(field_definition, raw_value, existing_files, row_index, df, column_name):
+        field_type = (field_definition.get("type") or "").strip()
+
+        if not has_cell_value(raw_value):
+            return skip_field
+
+        if field_type == "file_reference":
+            if not isinstance(raw_value, str):
+                raw_value = str(raw_value)
+            candidate = raw_value.strip()
+            filename = extract_filename_from_value(candidate)
+
+            if candidate.startswith('gid://'):
+                return candidate
+
+            existing_entry = fetch_file_reference(existing_files, filename)
+            if candidate.startswith('http'):
+                if existing_entry:
+                    set_dataframe_cell(df, row_index, column_name, existing_entry[1] or candidate)
+                    return existing_entry[0]
+                print(
+                    f"❌ Could not match Shopify file URL '{candidate}' to an existing file for "
+                    f"field '{field_definition.get('key')}'."
+                )
+                return None
+
+            if existing_entry:
+                set_dataframe_cell(df, row_index, column_name, existing_entry[1] or existing_entry[0])
+                return existing_entry[0]
+
+            file_path_local = resolve_local_asset_path(candidate)
+            if not file_path_local:
+                print(f"❌ File '{candidate}' was not found locally for field '{field_definition.get('key')}'.")
+                return None
+
+            url, gid = upload_file_to_shopify(file_path_local)
+            if not gid:
+                print(f"❌ Failed to upload file '{candidate}' for field '{field_definition.get('key')}'.")
+                return None
+
+            remember_file_reference(existing_files, filename or candidate, gid, url)
+            set_dataframe_cell(df, row_index, column_name, url or gid)
+            return gid
+
+        if field_type == "list.file_reference":
+            file_gids = []
+            for item in parse_metaobject_reference_values(raw_value):
+                resolved_gid = resolve_field_value(
+                    {"key": field_definition.get("key"), "type": "file_reference"},
+                    item,
+                    existing_files,
+                    row_index,
+                    df,
+                    column_name,
+                )
+                if not resolved_gid or resolved_gid is skip_field:
+                    return None
+                file_gids.append(resolved_gid)
+            return json.dumps(file_gids, ensure_ascii=False)
+
+        if field_type == "metaobject_reference":
+            return resolve_metaobject_reference_gid(field_definition, raw_value)
+
+        if field_type == "list.metaobject_reference":
+            resolved_gids = []
+            seen = set()
+            for item in parse_metaobject_reference_values(raw_value):
+                resolved_gid = resolve_metaobject_reference_gid(field_definition, item)
+                if not resolved_gid:
+                    return None
+                if resolved_gid not in seen:
+                    seen.add(resolved_gid)
+                    resolved_gids.append(resolved_gid)
+            return json.dumps(resolved_gids, ensure_ascii=False)
+
+        if field_type == "rich_text_field":
+            if isinstance(raw_value, str):
+                stripped_value = raw_value.strip()
+                if "<" in stripped_value and ">" in stripped_value:
+                    return json.dumps(html_to_shopify_json(stripped_value), ensure_ascii=False)
+                return stripped_value
+            return json.dumps(raw_value, ensure_ascii=False)
+
+        if field_type.startswith("list."):
+            return json.dumps(parse_generic_list_value(raw_value), ensure_ascii=False)
+
+        if field_type == "json" and isinstance(raw_value, (dict, list)):
+            return json.dumps(raw_value, ensure_ascii=False)
+
+        return normalize_scalar_value(field_type, raw_value)
+
+    def build_metaobject_input(definition, row_data, df, row_index, field_columns_by_key, existing_files):
+        field_inputs = []
+
+        for field_definition in definition["field_definitions"]:
+            expected_column_name = f"Field: {field_definition['key']} [{field_definition['type'] or 'unknown'}]"
+            candidate_columns = []
+            if expected_column_name in df.columns:
+                candidate_columns.append(expected_column_name)
+            for fallback_column in field_columns_by_key.get(field_definition["key"], []):
+                if fallback_column not in candidate_columns:
+                    candidate_columns.append(fallback_column)
+
+            if not candidate_columns:
+                continue
+
+            column_name = candidate_columns[0]
+            raw_value = row_data.get(column_name)
+            resolved_value = resolve_field_value(
+                field_definition,
+                raw_value,
+                existing_files,
+                row_index,
+                df,
+                column_name,
+            )
+            if resolved_value is skip_field:
+                continue
+            if resolved_value is None:
+                print(
+                    f"⚠️ Skipping field '{field_definition['key']}' for row {row_index + 2} "
+                    "because its value could not be resolved."
+                )
+                continue
+
+            field_inputs.append(
+                {
+                    "key": field_definition["key"],
+                    "value": resolved_value,
+                }
+            )
+
+        metaobject_input = {}
+
+        handle_value = row_data.get("Handle")
+        if has_cell_value(handle_value):
+            metaobject_input["handle"] = str(handle_value).strip()
+
+        if field_inputs:
+            metaobject_input["fields"] = field_inputs
+
+        publish_status_value = row_data.get("Publish Status")
+        if definition.get("publishable_enabled") and has_cell_value(publish_status_value):
+            normalized_status = str(publish_status_value).strip().upper()
+            if normalized_status in {"ACTIVE", "DRAFT"}:
+                metaobject_input["capabilities"] = {
+                    "publishable": {
+                        "status": normalized_status
+                    }
+                }
+            else:
+                print(
+                    f"⚠️ Ignoring invalid Publish Status '{publish_status_value}' for row "
+                    f"{row_index + 2}. Use ACTIVE or DRAFT."
+                )
+
+        return metaobject_input
+
+    def update_metaobject(metaobject_id, metaobject_input):
+        mutation = """
+        mutation MetaobjectUpdate($id: ID!, $metaobject: MetaobjectUpdateInput!) {
+          metaobjectUpdate(id: $id, metaobject: $metaobject) {
+            metaobject {
+              id
+              handle
+              displayName
+              updatedAt
+              capabilities {
+                publishable {
+                  status
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+              code
+            }
+          }
+        }
+        """
+        data = _graphql_post(
+            mutation,
+            {"id": metaobject_id, "metaobject": metaobject_input},
+            purpose=f"Metaobject update {metaobject_id}",
+        )
+        payload = (((data or {}).get("data") or {}).get("metaobjectUpdate") or {})
+        return payload.get("metaobject"), payload.get("userErrors") or []
+
+    def upsert_metaobject(metaobject_type, handle, metaobject_input):
+        mutation = """
+        mutation MetaobjectUpsert($handle: MetaobjectHandleInput!, $metaobject: MetaobjectUpsertInput!) {
+          metaobjectUpsert(handle: $handle, metaobject: $metaobject) {
+            metaobject {
+              id
+              handle
+              displayName
+              updatedAt
+              capabilities {
+                publishable {
+                  status
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+              code
+            }
+          }
+        }
+        """
+        variables = {
+            "handle": {
+                "type": metaobject_type,
+                "handle": handle,
+            },
+            "metaobject": metaobject_input,
+        }
+        data = _graphql_post(
+            mutation,
+            variables,
+            purpose=f"Metaobject upsert {metaobject_type}/{handle}",
+        )
+        payload = (((data or {}).get("data") or {}).get("metaobjectUpsert") or {})
+        return payload.get("metaobject"), payload.get("userErrors") or []
+
+    def create_metaobject(metaobject_type, metaobject_input):
+        mutation = """
+        mutation MetaobjectCreate($metaobject: MetaobjectCreateInput!) {
+          metaobjectCreate(metaobject: $metaobject) {
+            metaobject {
+              id
+              handle
+              displayName
+              updatedAt
+              capabilities {
+                publishable {
+                  status
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+              code
+            }
+          }
+        }
+        """
+        create_input = {"type": metaobject_type}
+        create_input.update(metaobject_input)
+        data = _graphql_post(
+            mutation,
+            {"metaobject": create_input},
+            purpose=f"Metaobject create {metaobject_type}",
+        )
+        payload = (((data or {}).get("data") or {}).get("metaobjectCreate") or {})
+        return payload.get("metaobject"), payload.get("userErrors") or []
+
+    def get_file_path():
+        ensure_tkinter_available()
+        root = tk.Tk()
+        root.withdraw()
+        return filedialog.askopenfilename(
+            title="Select Metaobjects Excel File",
+            filetypes=[("Excel files", "*.xlsx")]
+        )
+
+    file_path = file_path or get_file_path()
+    if not file_path:
         print("❌ No file selected.")
+        return None
+
+    print(f"📂 Reading metaobjects from file: {file_path}")
+    df = pd.read_excel(file_path)
+    df = df.where(pd.notnull(df), None)
+
+    field_columns_by_key = {}
+    field_column_pattern = re.compile(r"^Field:\s+(.+?)\s+\[(.+)\]$")
+    for column_name in df.columns:
+        match = field_column_pattern.match(column_name)
+        if not match:
+            continue
+        field_key = match.group(1).strip()
+        field_columns_by_key.setdefault(field_key, []).append(column_name)
+
+    print("📡 Fetching existing Shopify files for file-reference fields...")
+    existing_files = get_all_files() or {}
+    print(f"✅ Retrieved {len(existing_files)} existing Shopify file references.")
+
+    for index, row in df.iterrows():
+        row_data = row.to_dict()
+        metaobject_type = row_data.get("Type")
+        metaobject_id = row_data.get("ID")
+        handle_value = row_data.get("Handle")
+
+        if not has_cell_value(metaobject_type):
+            print(f"⚠️ Skipping row {index + 2} because the Type column is empty.")
+            continue
+
+        metaobject_type = str(metaobject_type).strip()
+        definition = get_metaobject_definition(metaobject_type)
+        if not definition:
+            print(f"⚠️ Skipping row {index + 2} because definition '{metaobject_type}' could not be loaded.")
+            continue
+
+        metaobject_input = build_metaobject_input(
+            definition,
+            row_data,
+            df,
+            index,
+            field_columns_by_key,
+            existing_files,
+        )
+
+        created_or_updated_metaobject = None
+        user_errors = []
+
+        if has_cell_value(metaobject_id):
+            created_or_updated_metaobject, user_errors = update_metaobject(
+                str(metaobject_id).strip(),
+                metaobject_input,
+            )
+        elif has_cell_value(handle_value):
+            created_or_updated_metaobject, user_errors = upsert_metaobject(
+                metaobject_type,
+                str(handle_value).strip(),
+                metaobject_input,
+            )
+        else:
+            created_or_updated_metaobject, user_errors = create_metaobject(
+                metaobject_type,
+                metaobject_input,
+            )
+
+        if user_errors:
+            print(
+                f"❌ Shopify returned metaobject user errors for row {index + 2}: "
+                f"{user_errors}"
+            )
+            continue
+
+        if not created_or_updated_metaobject:
+            print(f"❌ No metaobject payload was returned for row {index + 2}.")
+            continue
+
+        set_dataframe_cell(df, index, "ID", created_or_updated_metaobject.get("id"))
+        set_dataframe_cell(df, index, "Handle", created_or_updated_metaobject.get("handle"))
+        set_dataframe_cell(df, index, "Display Name", created_or_updated_metaobject.get("displayName"))
+        set_dataframe_cell(df, index, "Updated At", created_or_updated_metaobject.get("updatedAt"))
+
+        publish_status = (
+            ((((created_or_updated_metaobject.get("capabilities") or {}).get("publishable") or {}).get("status")))
+        )
+        if publish_status:
+            set_dataframe_cell(df, index, "Publish Status", publish_status)
+
+        print(
+            f"✅ Metaobject processed for row {index + 2}: "
+            f"{created_or_updated_metaobject.get('id')} ({created_or_updated_metaobject.get('handle')})"
+        )
+
+    df.to_excel(file_path, index=False)
+    print("✅ Metaobjects upload completed and the spreadsheet was updated with the latest IDs and handles.")
+    return file_path
 
 def start_download():
     def after_download():
@@ -5283,20 +6759,51 @@ def start_collection_upload():
     thread.start()
     root.after(100, check_thread, thread, after_collection_upload, "Upload completed!")
 
-def download_shopify_files_alt_texts():
-    import requests
-    import pandas as pd
-    import os
-    from datetime import datetime
 
-    if getattr(sys, 'frozen', False):
-        script_dir = os.path.dirname(sys.executable)
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    shopify_context = load_shopify_context(os.path.join(script_dir, 'credentials.txt'))
+def start_metaobject_download():
+    def after_metaobject_download():
+        metaobject_download_button.config(state=tk.NORMAL)
+        metaobject_upload_button.config(state=tk.NORMAL)
+
+    metaobject_download_button.config(state=tk.DISABLED)
+    metaobject_upload_button.config(state=tk.DISABLED)
+
+    thread = build_safe_thread("Metaobject download", metaobject_run_downloader_logic)
+    thread.start()
+    root.after(100, check_thread, thread, after_metaobject_download, "Metaobjects download completed!")
+
+
+def start_metaobject_upload():
+    def after_metaobject_upload():
+        metaobject_download_button.config(state=tk.NORMAL)
+        metaobject_upload_button.config(state=tk.NORMAL)
+
+    metaobject_download_button.config(state=tk.DISABLED)
+    metaobject_upload_button.config(state=tk.DISABLED)
+
+    thread = build_safe_thread("Metaobject upload", metaobject_run_uploader_logic)
+    thread.start()
+    root.after(100, check_thread, thread, after_metaobject_upload, "Metaobjects upload completed!")
+
+def download_shopify_files_alt_texts(shopify_context=None, script_dir=None, output_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
+
+    credentials_path = os.path.join(script_dir, 'credentials.txt')
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
+    granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=["read_files"],
+    )
+
+    if granted_access_scopes and "read_files" not in granted_access_scopes:
+        raise RuntimeError(
+            "The current Shopify token is missing the `read_files` scope. "
+            "Run `shopify app dev --reset`, accept the new scopes, and reinstall the app."
+        )
 
     GRAPHQL_URL = shopify_context["graphql_url"]
     headers = {
@@ -5340,10 +6847,16 @@ def download_shopify_files_alt_texts():
         data = response.json()
 
         if "errors" in data:
-            print(f"❌ Error fetching files: {data['errors']}")
-            break
+            raise RuntimeError(f"Error fetching Shopify files: {data['errors']}")
 
-        files = data['data']['files']['edges']
+        files_connection = (((data or {}).get("data") or {}).get("files") or {})
+        if not files_connection:
+            raise RuntimeError(
+                "Shopify did not return file data for the files query. "
+                "This usually means the app needs `read_files` and must be reinstalled."
+            )
+
+        files = files_connection.get('edges') or []
         for file in files:
             node = file['node']
             gid = node['id']
@@ -5354,37 +6867,53 @@ def download_shopify_files_alt_texts():
             all_files.append({
                 "Filename": filename,
                 "Alt Text": alt,
+                "New Alt Text": "",
                 "GID": gid,
                 "URL": url
             })
 
-        has_next_page = data['data']['files']['pageInfo']['hasNextPage']
+        has_next_page = bool((files_connection.get('pageInfo') or {}).get('hasNextPage'))
         if has_next_page:
             cursor = files[-1]['cursor']
     
-    # Save to Excel
-    df = pd.DataFrame(all_files)
+    resolved_output_dir = os.path.abspath(output_dir or script_dir)
+    os.makedirs(resolved_output_dir, exist_ok=True)
+
+    df = pd.DataFrame(
+        all_files,
+        columns=["Filename", "Alt Text", "New Alt Text", "GID", "URL"],
+    )
+    if not all_files:
+        print("⚠️ Shopify returned no uploaded files. The spreadsheet contains headers only.")
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"shopify_uploaded_files_alt_texts_{current_time}.xlsx"
+    file_name = os.path.join(
+        resolved_output_dir,
+        f"shopify_uploaded_files_alt_texts_{current_time}.xlsx"
+    )
     df.to_excel(file_name, index=False)
 
     print(f"✅ Files Alt Texts exported to {file_name}")
+    return file_name
 
-def upload_shopify_files_alt_texts():
-    import requests
-    import pandas as pd
-    import os
-    import tkinter as tk
-    from tkinter import filedialog
+def upload_shopify_files_alt_texts(file_path=None, shopify_context=None, script_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
 
-    if getattr(sys, 'frozen', False):
-        script_dir = os.path.dirname(sys.executable)
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    shopify_context = load_shopify_context(os.path.join(script_dir, 'credentials.txt'))
+    credentials_path = os.path.join(script_dir, 'credentials.txt')
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
     SHOP_NAME = shopify_context["shop_name"]
     ACCESS_TOKEN = shopify_context["access_token"]
+    granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=["write_files"],
+    )
+
+    if granted_access_scopes and "write_files" not in granted_access_scopes:
+        raise RuntimeError(
+            "The current Shopify token is missing the `write_files` scope. "
+            "Run `shopify app dev --reset`, accept the new scopes, and reinstall the app."
+        )
 
     GRAPHQL_URL = shopify_context["graphql_url"]
     headers = {
@@ -5392,15 +6921,17 @@ def upload_shopify_files_alt_texts():
         "X-Shopify-Access-Token": ACCESS_TOKEN
     }
 
-    root = tk.Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(
-        title="Select Shopify Files Alt Text Excel File",
-        filetypes=[("Excel files", "*.xlsx")]
-    )
+    if not file_path:
+        ensure_tkinter_available()
+        root = tk.Tk()
+        root.withdraw()
+        file_path = filedialog.askopenfilename(
+            title="Select Shopify Files Alt Text Excel File",
+            filetypes=[("Excel files", "*.xlsx")]
+        )
     if not file_path:
         print("❌ No file selected.")
-        return
+        return None
 
     df = pd.read_excel(file_path)
         
@@ -5408,8 +6939,7 @@ def upload_shopify_files_alt_texts():
     df = df.fillna('')
 
     if "GID" not in df.columns or "New Alt Text" not in df.columns:
-        print("❌ Excel must have 'GID' and 'New Alt Text' columns.")
-        return
+        raise RuntimeError("Excel must have 'GID' and 'New Alt Text' columns.")
 
     for idx, row in df.iterrows():
         gid = row['GID']
@@ -5447,11 +6977,15 @@ def upload_shopify_files_alt_texts():
         elif result['data']['fileUpdate']['userErrors']:
             print(f"❌ Shopify User Errors for file {gid}: {result['data']['fileUpdate']['userErrors']}")
         else:
+            set_dataframe_cell(df, idx, "Alt Text", new_alt_text)
             print(f"✅ Successfully updated Alt Text for File {gid}")
 
+    df.to_excel(file_path, index=False)
     print("✅ All Alt Text updates completed.")
+    return file_path
 
 def generate_seo_alt_texts():
+    ensure_tkinter_available()
     if getattr(sys, 'frozen', False):
         script_dir = os.path.dirname(sys.executable)
     else:
@@ -5630,7 +7164,7 @@ def start_detached_task(task_name, target):
 def load_background_logic():
     print("Loading additional logic (e.g., imports)...")
     global pandas, requests, openpyxl, datetime, math, ET, base64
-    
+
     import requests  # Example of delayed import
     from datetime import datetime
     import math
@@ -5638,51 +7172,72 @@ def load_background_logic():
     import base64
     print("Additional logic loaded successfully.")
 
-    
-# Set up Tkinter GUI
-root = tk.Tk()
-root.title("Shopify Tool")
 
-# Let row 0 (text area) expand, and column 0+1 share space
-root.rowconfigure(0, weight=1)
-root.columnconfigure(0, weight=1)
-root.columnconfigure(1, weight=1)
+def main():
+    ensure_tkinter_available()
+    global root
+    global text_area
+    global download_button
+    global upload_button
+    global collection_download_button
+    global collection_upload_button
+    global metaobject_download_button
+    global metaobject_upload_button
+    global file_alt_download_button
+    global file_alt_upload_button
+    global seo_alt_text_button
 
-# Text area in row 0
-text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD)
-text_area.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
+    root = tk.Tk()
+    root.title("Shopify Tool")
 
-use_gui_log = False
-if use_gui_log:
-    sys.stdout = RedirectOutput(text_area)
+    # Let row 0 (text area) expand, and column 0+1 share space
+    root.rowconfigure(0, weight=1)
+    root.columnconfigure(0, weight=1)
+    root.columnconfigure(1, weight=1)
 
-# Buttons in rows below
-download_button = tk.Button(root, text="Download", command=start_download, width=20, height=2)
-download_button.grid(row=1, column=0, pady=5)
+    # Text area in row 0
+    text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD)
+    text_area.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=10, pady=10)
 
-upload_button = tk.Button(root, text="Upload", command=start_upload, width=20, height=2)
-upload_button.grid(row=1, column=1, pady=5)
+    use_gui_log = False
+    if use_gui_log:
+        sys.stdout = RedirectOutput(text_area)
 
-collection_download_button = tk.Button(root, text="Download Collections", command=start_collection_download, width=20, height=2)
-collection_download_button.grid(row=2, column=0, pady=5)
+    # Buttons in rows below
+    download_button = tk.Button(root, text="Download", command=start_download, width=20, height=2)
+    download_button.grid(row=1, column=0, pady=5)
 
-collection_upload_button = tk.Button(root, text="Upload Collections", command=start_collection_upload, width=20, height=2)
-collection_upload_button.grid(row=2, column=1, pady=5)
+    upload_button = tk.Button(root, text="Upload", command=start_upload, width=20, height=2)
+    upload_button.grid(row=1, column=1, pady=5)
 
-file_alt_download_button = tk.Button(root, text="Download Files Alt Texts", command=lambda: start_detached_task("Download Files Alt Texts", download_shopify_files_alt_texts), width=25, height=2)
-file_alt_download_button.grid(row=3, column=0, pady=5)
+    collection_download_button = tk.Button(root, text="Download Collections", command=start_collection_download, width=20, height=2)
+    collection_download_button.grid(row=2, column=0, pady=5)
 
-file_alt_upload_button = tk.Button(root, text="Upload Files Alt Texts", command=lambda: start_detached_task("Upload Files Alt Texts", upload_shopify_files_alt_texts), width=25, height=2)
-file_alt_upload_button.grid(row=3, column=1, pady=5)
+    collection_upload_button = tk.Button(root, text="Upload Collections", command=start_collection_upload, width=20, height=2)
+    collection_upload_button.grid(row=2, column=1, pady=5)
 
-seo_alt_text_button = tk.Button(root, text="Generate SEO Alt Texts (AI)", command=lambda: start_detached_task("Generate SEO Alt Texts (AI)", generate_seo_alt_texts), width=30, height=2)
-seo_alt_text_button.grid(row=4, column=0, columnspan=2, pady=5)
+    metaobject_download_button = tk.Button(root, text="Download Metaobjects", command=start_metaobject_download, width=25, height=2)
+    metaobject_download_button.grid(row=3, column=0, pady=5)
 
-# Set window size
-root.geometry("500x700")
+    metaobject_upload_button = tk.Button(root, text="Upload Metaobjects", command=start_metaobject_upload, width=25, height=2)
+    metaobject_upload_button.grid(row=3, column=1, pady=5)
 
-# Show the window first, then load heavy logic in the background
-root.after(100, lambda: start_detached_task("Background setup", load_background_logic))
+    file_alt_download_button = tk.Button(root, text="Download Files Alt Texts", command=lambda: start_detached_task("Download Files Alt Texts", download_shopify_files_alt_texts), width=25, height=2)
+    file_alt_download_button.grid(row=4, column=0, pady=5)
 
-# Run the application
-root.mainloop()
+    file_alt_upload_button = tk.Button(root, text="Upload Files Alt Texts", command=lambda: start_detached_task("Upload Files Alt Texts", upload_shopify_files_alt_texts), width=25, height=2)
+    file_alt_upload_button.grid(row=4, column=1, pady=5)
+
+    seo_alt_text_button = tk.Button(root, text="Generate SEO Alt Texts (AI)", command=lambda: start_detached_task("Generate SEO Alt Texts (AI)", generate_seo_alt_texts), width=30, height=2)
+    seo_alt_text_button.grid(row=5, column=0, columnspan=2, pady=5)
+
+    # Set window size
+    root.geometry("540x780")
+
+    # Show the window first, then load heavy logic in the background
+    root.after(100, lambda: start_detached_task("Background setup", load_background_logic))
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

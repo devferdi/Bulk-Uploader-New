@@ -27,6 +27,7 @@ Recommended starting scopes for this repo:
 - `read_files`
 - `write_files`
 - `read_metaobjects`
+- `write_metaobjects`
 - `read_metaobject_definitions`
 
 Add more only if testing shows they are required for your specific metafield or collection workflows.
