@@ -2,7 +2,7 @@
 
 client_id = "ad4763aa9e119e137fecb4a4cfa918cb"
 name = "HUX Bulk Loader"
-application_url = "https://example.com"
+application_url = "https://hux-bulk-loader.onrender.com"
 embedded = true
 
 [build]
@@ -26,4 +26,4 @@ optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ "https://example.com/auth/callback" ]
+redirect_urls = [ "https://hux-bulk-loader.onrender.com/auth/callback" ]
