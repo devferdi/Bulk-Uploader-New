@@ -2,7 +2,6 @@ import { useState } from "react";
 import type { ChangeEvent, CSSProperties } from "react";
 import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { useRouteError } from "react-router";
-import { useAppBridge } from "@shopify/app-bridge-react";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 
 import { authenticate } from "../shopify.server";
@@ -58,6 +57,17 @@ type BulkWorkflowModule = {
   uploadStartError: string;
   uploadSuccessMessage: string;
   workerFileDownloadError: string;
+};
+
+type ShopifyToastOptions = {
+  duration?: number;
+  isError?: boolean;
+};
+
+type ShopifyGlobal = {
+  toast?: {
+    show: (message: string, options?: ShopifyToastOptions) => void;
+  };
 };
 
 const BULK_WORKFLOW_MODULES: BulkWorkflowModule[] = [
@@ -428,8 +438,16 @@ function triggerFileDownload(blob: Blob, fileName: string) {
   }, 0);
 }
 
+function showToast(message: string, options?: ShopifyToastOptions) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const shopifyGlobal = (window as Window & { shopify?: ShopifyGlobal }).shopify;
+  shopifyGlobal?.toast?.show(message, options);
+}
+
 export default function Index() {
-  const shopify = useAppBridge();
   const [workflowState, setWorkflowState] = useState<WorkflowState>(
     createInitialWorkflowState,
   );
@@ -547,14 +565,14 @@ export default function Index() {
       );
 
       triggerFileDownload(spreadsheetBlob, fileName);
-      shopify.toast.show(module.downloadSuccessMessage);
+      showToast(module.downloadSuccessMessage);
     } catch (error) {
       const message =
         error instanceof Error
           ? error.message
           : "Could not download the workbook.";
 
-      shopify.toast.show(message, { duration: 5000, isError: true });
+      showToast(message, { duration: 5000, isError: true });
     } finally {
       updateWorkflowState(module.id, { isDownloading: false });
     }
@@ -576,7 +594,7 @@ export default function Index() {
     const selectedFile = workflowState[module.id].selectedFile;
 
     if (!selectedFile) {
-      shopify.toast.show("Choose an .xlsx spreadsheet before uploading.", {
+      showToast("Choose an .xlsx spreadsheet before uploading.", {
         duration: 5000,
         isError: true,
       });
@@ -584,7 +602,7 @@ export default function Index() {
     }
 
     if (!selectedFile.name.toLowerCase().endsWith(".xlsx")) {
-      shopify.toast.show("Please upload an .xlsx spreadsheet.", {
+      showToast("Please upload an .xlsx spreadsheet.", {
         duration: 5000,
         isError: true,
       });
@@ -618,14 +636,14 @@ export default function Index() {
 
       triggerFileDownload(spreadsheetBlob, fileName);
       updateWorkflowState(module.id, { selectedFile: null });
-      shopify.toast.show(module.uploadSuccessMessage);
+      showToast(module.uploadSuccessMessage);
     } catch (error) {
       const message =
         error instanceof Error
           ? error.message
           : "Could not upload the workbook.";
 
-      shopify.toast.show(message, { duration: 5000, isError: true });
+      showToast(message, { duration: 5000, isError: true });
     } finally {
       updateWorkflowState(module.id, { isUploading: false });
     }
