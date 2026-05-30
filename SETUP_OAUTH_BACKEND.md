@@ -26,6 +26,8 @@ Recommended starting scopes for this repo:
 - `read_locations`
 - `read_files`
 - `write_files`
+- `read_content`
+- `write_content`
 - `read_metaobjects`
 - `write_metaobjects`
 - `read_metaobject_definitions`

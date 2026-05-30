@@ -6,6 +6,10 @@ This app is now prepared to be deployed as a single hosted service that includes
 - the Python spreadsheet worker
 - the existing `Shopify Bulk Tool.py` logic
 
+If you need a second merchant in a different organization, do not reuse the
+same Shopify app record and runtime instance. Create a separate app and
+deployment. See `INSTALL_ORIOR.md` for the ORIOR setup pattern.
+
 ## 1. Host the app
 
 Use a host that can deploy a Dockerfile from the repo root.
@@ -31,7 +35,7 @@ If you deploy without the Blueprint, set these on the host:
 ```text
 SHOPIFY_API_KEY=
 SHOPIFY_API_SECRET=
-SCOPES=read_files,write_files,write_inventory,read_inventory,read_locations,read_metaobject_definitions,read_metaobjects,write_metaobjects,read_products,write_products
+SCOPES=read_files,write_files,read_content,write_content,write_inventory,read_inventory,read_locations,read_metaobject_definitions,read_metaobjects,write_metaobjects,read_products,write_products
 SHOPIFY_APP_URL=https://your-real-hostname.example
 DATABASE_URL=file:./prisma/dev.sqlite
 NODE_ENV=production
@@ -50,7 +54,7 @@ For a real production setup, replace the SQLite `DATABASE_URL` with a managed da
 Edit:
 
 ```text
-shopify.app.hux-bulk-loader.toml
+shopify.app.toml
 ```
 
 Set:
@@ -69,7 +73,7 @@ From:
 Run:
 
 ```bash
-shopify app deploy --config shopify.app.hux-bulk-loader.toml
+shopify app deploy --config shopify.app.toml
 ```
 
 ## 5. Install on the real store
@@ -81,3 +85,11 @@ In the Shopify Partner / Dev Dashboard:
 3. Add `biotta-ag.myshopify.com`.
 4. Generate the install link.
 5. Open the link as the store owner and install the app.
+
+If Shopify shows `Oauth error invalid_link_organization`, the link was generated
+from the wrong app record or wrong Partner organization. Regenerate the install
+link from the same app as `shopify.app.toml`:
+
+- app name: `HUX Bulk Loader`
+- client ID: `ad4763aa9e119e137fecb4a4cfa918cb`
+- allowed store: `biotta-ag.myshopify.com`

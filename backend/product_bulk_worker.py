@@ -56,6 +56,8 @@ def parse_args():
             "collections-upload",
             "file-alt-texts-download",
             "file-alt-texts-upload",
+            "blog-entries-download",
+            "blog-entries-upload",
         ],
     )
     parser.add_argument("--shop", required=True, help="Shop domain or shop name.")
@@ -168,6 +170,27 @@ def main():
             raise RuntimeError("--file is required when action=file-alt-texts-upload")
 
         output_path = module.upload_shopify_files_alt_texts(
+            file_path=args.file,
+            shopify_context=shopify_context,
+            script_dir=args.script_dir,
+        )
+        emit_result(args.action, output_path)
+        return 0
+
+    if args.action == "blog-entries-download":
+        output_path = module.blog_entries_run_downloader_logic(
+            shopify_context=shopify_context,
+            script_dir=args.script_dir,
+            output_dir=args.output_dir,
+        )
+        emit_result(args.action, output_path)
+        return 0
+
+    if args.action == "blog-entries-upload":
+        if not args.file:
+            raise RuntimeError("--file is required when action=blog-entries-upload")
+
+        output_path = module.blog_entries_run_uploader_logic(
             file_path=args.file,
             shopify_context=shopify_context,
             script_dir=args.script_dir,

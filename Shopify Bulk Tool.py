@@ -3601,6 +3601,211 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             }
             return []
 
+        def normalize_image_source_for_compare(value):
+            raw_value = str(value or "").strip()
+            if not raw_value:
+                return ""
+
+            parsed = urllib.parse.urlparse(raw_value)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.netloc}{urllib.parse.unquote(parsed.path)}".casefold()
+
+            return raw_value.casefold()
+
+        def get_product_media_images(product_id):
+            if not product_id:
+                return []
+
+            query = """
+            query ProductMediaImages($id: ID!) {
+              product(id: $id) {
+                id
+                media(first: 250) {
+                  nodes {
+                    ... on MediaImage {
+                      id
+                      alt
+                      image {
+                        url
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """
+            data = _graphql_post(
+                query,
+                {"id": to_gid("Product", product_id)},
+                purpose=f"Product media lookup for {product_id}",
+            )
+            nodes = (
+                (((data or {}).get("data") or {}).get("product") or {})
+                .get("media", {})
+                .get("nodes", [])
+            )
+
+            media_images = []
+            for node in nodes:
+                image_url = ((node.get("image") or {}).get("url"))
+                if not image_url:
+                    continue
+                media_images.append(
+                    {
+                        "media_id": node.get("id"),
+                        "src": image_url,
+                        "alt": node.get("alt"),
+                    }
+                )
+
+            return media_images
+
+        def find_existing_product_image(product_id, image_url):
+            target = normalize_image_source_for_compare(image_url)
+            if not target:
+                return None
+
+            for image in get_product_images(product_id):
+                image_src = image.get("src")
+                if normalize_image_source_for_compare(image_src) == target:
+                    return {
+                        "image_id": image.get("id"),
+                        "media_id": image.get("admin_graphql_api_id"),
+                        "src": image_src,
+                    }
+
+            for image in get_product_media_images(product_id):
+                if normalize_image_source_for_compare(image.get("src")) == target:
+                    return image
+
+            return None
+
+        def create_product_media_image(product_id, image_url, alt_text=None):
+            mutation = """
+            mutation CreateProductImageMedia($productId: ID!, $media: [CreateMediaInput!]!) {
+              productCreateMedia(productId: $productId, media: $media) {
+                media {
+                  id
+                  alt
+                  status
+                  ... on MediaImage {
+                    image {
+                      url
+                    }
+                  }
+                }
+                mediaUserErrors {
+                  field
+                  message
+                  code
+                }
+              }
+            }
+            """
+            variables = {
+                "productId": to_gid("Product", product_id),
+                "media": [
+                    {
+                        "mediaContentType": "IMAGE",
+                        "originalSource": image_url,
+                        "alt": alt_text if has_cell_value(alt_text) else "",
+                    }
+                ],
+            }
+            data = _graphql_post(
+                mutation,
+                variables,
+                purpose=f"Product media image create for {product_id}",
+            )
+            payload = (((data or {}).get("data") or {}).get("productCreateMedia") or {})
+            user_errors = payload.get("mediaUserErrors") or []
+            if user_errors:
+                print(
+                    f"Failed to attach product image '{image_url}' to product {product_id}: "
+                    f"{user_errors}"
+                )
+                return None, None
+
+            media_nodes = payload.get("media") or []
+            if not media_nodes:
+                print(f"No product media payload returned for image '{image_url}'.")
+                return None, None
+
+            media = media_nodes[0]
+            media_gid = media.get("id")
+            if media_gid and not _wait_until_media_ready(media_gid, timeout_s=240, interval_s=3):
+                return None, None
+
+            resolved_url = ((media.get("image") or {}).get("url"))
+            if not resolved_url and media_gid:
+                resolved_url = get_image_url_for_gid(media_gid)
+
+            return media_gid, resolved_url or image_url
+
+        def resolve_product_image_source(product_id, image_value, row_index, image_column):
+            if not has_cell_value(image_value):
+                return None
+
+            image_reference = str(image_value).strip()
+            if not image_reference:
+                return None
+
+            if is_valid_gid(image_reference):
+                resolved_url = get_image_url_for_gid(image_reference)
+                if resolved_url:
+                    set_dataframe_cell(df, row_index, image_column, resolved_url)
+                    return resolved_url
+                print(f"Could not resolve image URL from GID '{image_reference}' for product {product_id}.")
+                return None
+
+            if image_reference.startswith(("http://", "https://")):
+                return image_reference
+
+            existing_entry = fetch_file_reference(existing_files, image_reference)
+            if existing_entry:
+                _, existing_url = existing_entry
+                if existing_url:
+                    set_dataframe_cell(df, row_index, image_column, existing_url)
+                    return existing_url
+
+            file_path_local = resolve_local_asset_path(image_reference)
+            if not file_path_local:
+                print(f"Image file '{image_reference}' not found in local folders.")
+                return None
+
+            uploaded_url, uploaded_gid = upload_image_to_shopify(file_path_local)
+            if not uploaded_url:
+                print(f"Failed to upload image file '{image_reference}' to Shopify Files.")
+                return None
+
+            remember_file_reference(existing_files, image_reference, uploaded_gid, uploaded_url)
+            set_dataframe_cell(df, row_index, image_column, uploaded_url)
+            return uploaded_url
+
+        def ensure_product_image(product_id, image_value, alt_text, row_index, image_column):
+            image_url = resolve_product_image_source(product_id, image_value, row_index, image_column)
+            if not image_url:
+                return None
+
+            existing_image = find_existing_product_image(product_id, image_url)
+            if existing_image:
+                resolved_src = existing_image.get("src") or image_url
+                set_dataframe_cell(df, row_index, image_column, resolved_src)
+                print(f"Product {product_id} already has image '{resolved_src}'.")
+                return resolved_src
+
+            media_gid, resolved_url = create_product_media_image(product_id, image_url, alt_text)
+            if not media_gid:
+                return None
+
+            set_dataframe_cell(df, row_index, image_column, resolved_url)
+            product_images_cache.pop(str(product_id), None)
+            product_image_identifier_cache.pop(str(product_id), None)
+            get_product_images(product_id, force_refresh=True)
+
+            print(f"Attached image '{resolved_url}' to product {product_id}.")
+            return resolved_url
+
         def ensure_variant_image(product_id, image_value, alt_text, row_index, handle=None):
             if not image_value:
                 return None, None
@@ -3954,82 +4159,6 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
 
 
 
-        # Collect image filenames from the spreadsheet
-        for index, row in df.iterrows():
-            # Process product images
-            for i in range(1, 21):  # Assuming a maximum of 20 images per product
-                image_column = f"Image {i}"
-                if image_column in row and row[image_column]:
-                    image_value = row[image_column]
-                    if isinstance(image_value, str) and not image_value.startswith(('http', 'gid://')):
-                        filename = image_value
-                        existing_entry = fetch_file_reference(existing_files, filename)
-                        if existing_entry:
-                            gid, url = existing_entry
-                            # Replace cell value with URL
-                            set_dataframe_cell(df, index, image_column, url)
-                        else:
-                            # Upload image to Shopify
-                            file_path_local = os.path.join(IMAGE_FOLDER, filename)
-                            if os.path.exists(file_path_local):
-                                with open(file_path_local, "rb") as image_file:
-                                    encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-
-                                 # Retrieve alt_text or set to default
-                                alt_text = row.get("Alt Text", None)  # Use "Alt Text" or the correct column name
-                                if not pd.notna(alt_text):  # If alt_text is not available or NaN
-                                    alt_text = filename
-                                    
-                                image_data = {
-                                    "image": {
-                                        "attachment": encoded_string,
-                                        "filename": filename,
-                                        "alt": alt_text if pd.notna(alt_text) else filename
-                                    }
-                                }
-                                product_id = row.get('ID')
-                                if pd.notna(product_id):
-                                    if pd.isna(product_id):
-                                        product_id = None
-                                    else:
-                                        # Convert to string without the .0
-                                        product_id = str(int(product_id))
-
-                                    url_api = f"{BASE_URL}/products/{product_id}/images.json"
-                                    response = requests.post(url_api, headers=headers, json=image_data)
-                                    if response.status_code in [200, 201]:
-                                        image = response.json().get('image', {})
-                                        image_url = image.get('src')
-                                        image_gid = image.get('admin_graphql_api_id')
-
-                                        if not is_valid_gid(image_gid):
-                                            uploaded_url, uploaded_gid = upload_image_to_shopify(file_path_local)
-                                            if is_valid_gid(uploaded_gid):
-                                                image_gid = uploaded_gid
-                                                if uploaded_url:
-                                                    image_url = uploaded_url
-
-                                        print(f"Successfully uploaded image {filename} to product {product_id}")
-                                        # Update cell value with image URL
-                                        set_dataframe_cell(df, index, image_column, image_url)
-
-                                        if is_valid_gid(image_gid):
-                                            remember_file_reference(existing_files, filename, image_gid, image_url)
-                                        else:
-                                            print(
-                                                f"⚠️ Unable to determine gid for image {filename}; variant metafields will "
-                                                "re-upload if needed."
-                                            )
-                                    else:
-                                        print(f"Failed to upload image {filename} to product {product_id}: {response.status_code}, {response.text}")
-                                else:
-                                    print(f"Product ID missing for row {index}, cannot upload image {filename}")
-                            else:
-                                print(f"Image file {filename} not found in local folder.")
-
-            
-
-
         # Initialize a variable to store the last valid handle
         last_valid_handle = None
         # Cache to avoid uploading the same variant image multiple times per product/option1
@@ -4245,57 +4374,26 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 if product_id:
                     print("Updating Images and Metafields now.")
 
-                    # Collect image URLs and alt texts
-                    images = []
-                    alt_texts = []
+                    product_image_updated = False
                     for i in range(1, 21):
                         image_column = f"Image {i}"
                         alt_column = f"Image {i} Alt"
-                        image_url = row.get(image_column)
+                        image_value = row.get(image_column)
                         alt_text = row.get(alt_column)
 
-                        if image_url and isinstance(image_url, str):
-                            if image_url.startswith('http'):
-                                # If it's already a URL, append it directly
-                                images.append(image_url)
-                                alt_texts.append(alt_text)
-                            else:
-                                # Handle local file upload (if necessary)
-                                filename = image_url
-                                file_path_local = os.path.join(IMAGE_FOLDER, filename)
-                                if os.path.exists(file_path_local):
-                                    # Upload the image and get the URL
-                                    with open(file_path_local, "rb") as image_file:
-                                        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                                    image_data = {
-                                        "image": {
-                                            "attachment": encoded_string,
-                                            "filename": filename,
-                                            "alt": alt_text if pd.notna(alt_text) else filename
-                                        }
-                                    }
-                                    url_api = f"{BASE_URL}/products/{product_id}/images.json"
-                                    response = requests.post(url_api, headers=headers, json=image_data)
-                                    if response.status_code in [200, 201]:
-                                        image = response.json().get('image', {})
-                                        image_url = image.get('src')
-                                        print(f"Successfully uploaded image {filename} to product {product_id}")
-                                        # Update cell value with image URL
-                                        set_dataframe_cell(df, index, image_column, image_url)
-                                        images.append(image_url)
-                                        alt_texts.append(alt_text)
-                                    else:
-                                        print(f"Failed to upload image {filename} to product {product_id}: {response.status_code}, {response.text}")
-                                else:
-                                    print(f"Image file {filename} not found in local folder.")
-                        else:
-                            continue  # Skip if image URL is not valid
+                        if not has_cell_value(image_value):
+                            continue
 
-                    # Update product images with alt texts
-                    if images:
-                        update_product_images(product_id, images, alt_texts)
+                        resolved_image = ensure_product_image(
+                            product_id,
+                            image_value,
+                            alt_text,
+                            index,
+                            image_column,
+                        )
+                        product_image_updated = bool(resolved_image) or product_image_updated
 
-                        # Retrieve the updated images to get their IDs
+                    if product_image_updated:
                         product_images = get_product_images(product_id, force_refresh=True)
                         if not product_images:
                             print(f"No images retrieved for product {product_id} after update.")
@@ -6705,6 +6803,1544 @@ def metaobject_run_uploader_logic(file_path=None, shopify_context=None, script_d
     print("✅ Metaobjects upload completed and the spreadsheet was updated with the latest IDs and handles.")
     return file_path
 
+
+def blog_entries_run_downloader_logic(shopify_context=None, script_dir=None, output_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
+
+    credentials_path = os.path.join(script_dir, 'credentials.txt')
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
+    ACCESS_TOKEN = shopify_context["access_token"]
+    GRAPHQL_URL = shopify_context["graphql_url"]
+    granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
+
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=["read_content"],
+    )
+
+    if granted_access_scopes and not (
+        {"read_content", "read_online_store_pages"} & granted_access_scopes
+    ):
+        raise RuntimeError(
+            "The current Shopify token is missing the `read_content` scope. "
+            "Run `shopify app dev --reset`, accept the new scopes, and reinstall the app."
+        )
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": ACCESS_TOKEN
+    }
+
+    reference_label_cache = {}
+
+    def _graphql_post(query, variables=None, purpose="(unspecified)", fail_on_errors=True):
+        payload = {"query": query, "variables": variables or {}}
+        try:
+            response = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as exc:
+            raise RuntimeError(f"GraphQL {purpose} request failed: {exc}") from exc
+        except ValueError as exc:
+            raise RuntimeError(f"GraphQL {purpose} returned invalid JSON: {exc}") from exc
+
+        if data.get("errors"):
+            message = f"GraphQL {purpose} errors: {data['errors']}"
+            if fail_on_errors:
+                raise RuntimeError(message)
+            print(f"Warning: {message}")
+        return data
+
+    def parse_reference_values(value):
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        try:
+            if pd.isna(value):
+                return []
+        except TypeError:
+            pass
+
+        raw_value = str(value).strip()
+        if not raw_value:
+            return []
+
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+
+        return [item.strip() for item in re.split(r"[\n,;]+", raw_value) if item.strip()]
+
+    def get_metaobject_display_label(metaobject_gid):
+        query = """
+        query MetaobjectNode($id: ID!) {
+          node(id: $id) {
+            ... on Metaobject {
+              id
+              displayName
+              handle
+              fields {
+                key
+                value
+              }
+            }
+          }
+        }
+        """
+        try:
+            data = _graphql_post(
+                query,
+                {"id": metaobject_gid},
+                purpose=f"Metaobject label lookup for {metaobject_gid}",
+                fail_on_errors=False,
+            )
+        except RuntimeError as exc:
+            print(f"Warning: {exc}")
+            return metaobject_gid
+
+        node = (((data or {}).get("data") or {}).get("node") or {})
+        label_candidates = [
+            node.get("displayName"),
+            next(
+                (
+                    field.get("value")
+                    for field in (node.get("fields") or [])
+                    if (field.get("key") or "").strip().lower() in {"title", "name", "label"}
+                    and field.get("value")
+                ),
+                None,
+            ),
+            node.get("handle"),
+        ]
+        return next((candidate for candidate in label_candidates if candidate), metaobject_gid)
+
+    def get_product_display_label(product_gid):
+        query = """
+        query ProductNode($id: ID!) {
+          node(id: $id) {
+            ... on Product {
+              id
+              title
+              handle
+            }
+          }
+        }
+        """
+        try:
+            data = _graphql_post(
+                query,
+                {"id": product_gid},
+                purpose=f"Product label lookup for {product_gid}",
+                fail_on_errors=False,
+            )
+        except RuntimeError as exc:
+            print(f"Warning: {exc}")
+            return product_gid
+
+        node = (((data or {}).get("data") or {}).get("node") or {})
+        title = node.get("title")
+        handle = node.get("handle")
+        if title and handle:
+            return f"{title} ({handle})"
+        return title or handle or product_gid
+
+    def get_file_display_label(file_gid):
+        query = """
+        query FileNode($id: ID!) {
+          node(id: $id) {
+            ... on GenericFile {
+              url
+            }
+            ... on MediaImage {
+              image {
+                url
+              }
+            }
+          }
+        }
+        """
+        try:
+            data = _graphql_post(
+                query,
+                {"id": file_gid},
+                purpose=f"File label lookup for {file_gid}",
+                fail_on_errors=False,
+            )
+        except RuntimeError as exc:
+            print(f"Warning: {exc}")
+            return file_gid
+
+        node = (((data or {}).get("data") or {}).get("node") or {})
+        return node.get("url") or ((node.get("image") or {}).get("url")) or file_gid
+
+    def get_reference_display_label(gid):
+        if not gid or not str(gid).startswith("gid://shopify/"):
+            return gid
+
+        if gid in reference_label_cache:
+            return reference_label_cache[gid]
+
+        if "/Metaobject/" in gid:
+            label = get_metaobject_display_label(gid)
+        elif "/Product/" in gid:
+            label = get_product_display_label(gid)
+        elif "/MediaImage/" in gid or "/GenericFile/" in gid or "/File/" in gid:
+            label = get_file_display_label(gid)
+        else:
+            label = gid
+
+        reference_label_cache[gid] = label
+        return label
+
+    def resolve_downloaded_metafield_value(metafield):
+        field_type = (metafield.get("type") or "").strip().lower()
+        raw_value = metafield.get("value")
+
+        if raw_value in (None, ""):
+            return raw_value
+
+        reference_types = {
+            "file_reference",
+            "metaobject_reference",
+            "mixed_reference",
+            "product_reference",
+            "collection_reference",
+            "page_reference",
+        }
+
+        if field_type in reference_types:
+            return get_reference_display_label(str(raw_value).strip())
+
+        if field_type.startswith("list.") and field_type.replace("list.", "", 1) in reference_types:
+            resolved_values = [
+                get_reference_display_label(item)
+                for item in parse_reference_values(raw_value)
+            ]
+            resolved_values = [value for value in resolved_values if value]
+            return ", ".join(resolved_values) if resolved_values else raw_value
+
+        return raw_value
+
+    def extract_metafield_type_name(definition):
+        field_type = definition.get("type")
+        if isinstance(field_type, dict):
+            return (field_type.get("name") or "").strip()
+        return str(field_type or "").strip()
+
+    def fetch_article_metafield_definitions():
+        query = """
+        query ArticleMetafieldDefinitions($after: String) {
+          metafieldDefinitions(ownerType: ARTICLE, first: 250, after: $after) {
+            nodes {
+              id
+              name
+              namespace
+              key
+              type {
+                name
+              }
+              validations {
+                name
+                value
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        definitions = []
+        cursor = None
+        has_next_page = True
+        while has_next_page:
+            data = _graphql_post(
+                query,
+                {"after": cursor},
+                purpose="Article metafield definitions export",
+            )
+            connection = (((data or {}).get("data") or {}).get("metafieldDefinitions") or {})
+            definitions.extend(connection.get("nodes") or [])
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        return definitions
+
+    def fetch_article_metafields(article_id):
+        query = """
+        query ArticleMetafields($id: ID!, $after: String) {
+          node(id: $id) {
+            ... on Article {
+              metafields(first: 250, after: $after) {
+                nodes {
+                  id
+                  namespace
+                  key
+                  type
+                  value
+                  definition {
+                    name
+                  }
+                }
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+              }
+            }
+          }
+        }
+        """
+
+        metafields = []
+        cursor = None
+        has_next_page = True
+        while has_next_page:
+            data = _graphql_post(
+                query,
+                {"id": article_id, "after": cursor},
+                purpose=f"Article metafields export for {article_id}",
+            )
+            node = (((data or {}).get("data") or {}).get("node") or {})
+            connection = node.get("metafields") or {}
+            metafields.extend(connection.get("nodes") or [])
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        return metafields
+
+    def fetch_all_articles():
+        query = """
+        query BlogArticles($after: String) {
+          articles(first: 250, after: $after) {
+            nodes {
+              id
+              title
+              handle
+              body
+              summary
+              tags
+              isPublished
+              publishedAt
+              createdAt
+              updatedAt
+              templateSuffix
+              author {
+                name
+              }
+              blog {
+                id
+                title
+                handle
+              }
+              image {
+                altText
+                url
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        articles = []
+        cursor = None
+        has_next_page = True
+        while has_next_page:
+            data = _graphql_post(query, {"after": cursor}, purpose="Blog articles export")
+            connection = (((data or {}).get("data") or {}).get("articles") or {})
+            articles.extend(connection.get("nodes") or [])
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        return articles
+
+    base_columns = [
+        "ID",
+        "Blog ID",
+        "Blog Title",
+        "Blog Handle",
+        "Title",
+        "Handle",
+        "Author",
+        "Body HTML",
+        "Summary HTML",
+        "Tags",
+        "Published",
+        "Published At",
+        "Template Suffix",
+        "Image URL",
+        "Image Alt Text",
+        "Created At",
+        "Updated At",
+    ]
+
+    print("Fetching article metafield definitions...")
+    definitions = fetch_article_metafield_definitions()
+    definition_columns = set()
+    for definition in definitions:
+        namespace = definition.get("namespace") or ""
+        key = definition.get("key") or ""
+        field_type = extract_metafield_type_name(definition) or "unknown"
+        if namespace and key:
+            definition_columns.add(f"Metafield: {namespace}.{key} [{field_type}]")
+
+    print("Fetching blog articles...")
+    articles = fetch_all_articles()
+    rows = []
+    all_metafield_columns = set(definition_columns)
+
+    for article in articles:
+        article_id = article.get("id") or ""
+        blog = article.get("blog") or {}
+        author = article.get("author") or {}
+        image = article.get("image") or {}
+        metafields = fetch_article_metafields(article_id) if article_id else []
+
+        row = {
+            "ID": article_id,
+            "Blog ID": blog.get("id") or "",
+            "Blog Title": blog.get("title") or "",
+            "Blog Handle": blog.get("handle") or "",
+            "Title": article.get("title") or "",
+            "Handle": article.get("handle") or "",
+            "Author": author.get("name") or "",
+            "Body HTML": article.get("body") or "",
+            "Summary HTML": article.get("summary") or "",
+            "Tags": ", ".join(article.get("tags") or []),
+            "Published": "yes" if article.get("isPublished") else "no",
+            "Published At": article.get("publishedAt") or "",
+            "Template Suffix": article.get("templateSuffix") or "",
+            "Image URL": image.get("url") or "",
+            "Image Alt Text": image.get("altText") or "",
+            "Created At": article.get("createdAt") or "",
+            "Updated At": article.get("updatedAt") or "",
+        }
+
+        for metafield in metafields:
+            namespace = metafield.get("namespace") or ""
+            key = metafield.get("key") or ""
+            field_type = metafield.get("type") or "unknown"
+            if not namespace or not key:
+                continue
+            column_name = f"Metafield: {namespace}.{key} [{field_type}]"
+            all_metafield_columns.add(column_name)
+            row[column_name] = resolve_downloaded_metafield_value(metafield)
+
+        rows.append(row)
+
+    ordered_metafield_columns = sorted(all_metafield_columns, key=str.casefold)
+    if rows:
+        df = pd.DataFrame(rows)
+    else:
+        df = pd.DataFrame(columns=base_columns + ordered_metafield_columns)
+
+    for column_name in base_columns + ordered_metafield_columns:
+        if column_name not in df.columns:
+            df[column_name] = None
+
+    df = df[base_columns + ordered_metafield_columns]
+
+    resolved_output_dir = os.path.abspath(output_dir or script_dir)
+    os.makedirs(resolved_output_dir, exist_ok=True)
+
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_path = os.path.join(
+        resolved_output_dir,
+        f"shopify_blog_entries_{current_time}.xlsx"
+    )
+    df.to_excel(file_path, index=False)
+
+    wb = load_workbook(file_path)
+    ws = wb.active
+    ws.title = "Blog Entries"
+    bold_font = Font(bold=True)
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        if row[0].value:
+            for cell in row:
+                cell.font = bold_font
+    ws.freeze_panes = ws['B2']
+    wb.save(file_path)
+
+    print(f"Blog entries exported to {file_path}")
+    return file_path
+
+
+def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
+    script_dir = resolve_runtime_script_dir(script_dir)
+
+    credentials_path = os.path.join(script_dir, 'credentials.txt')
+    if shopify_context is None:
+        shopify_context = load_shopify_context(credentials_path)
+    ACCESS_TOKEN = shopify_context["access_token"]
+    GRAPHQL_URL = shopify_context["graphql_url"]
+    granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
+
+    log_shopify_access_scope_diagnostics(
+        shopify_context,
+        required_scopes=["write_content"],
+    )
+
+    if granted_access_scopes and not (
+        {"write_content", "write_online_store_pages"} & granted_access_scopes
+    ):
+        raise RuntimeError(
+            "The current Shopify token is missing the `write_content` scope. "
+            "Run `shopify app dev --reset`, accept the new scopes, and reinstall the app."
+        )
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": ACCESS_TOKEN
+    }
+
+    import xml.etree.ElementTree as ET
+
+    image_folder = os.path.join(script_dir, 'img')
+    file_folder = os.path.join(script_dir, 'files')
+    asset_directories = []
+    for candidate in [image_folder, file_folder, script_dir]:
+        if candidate and candidate not in asset_directories:
+            asset_directories.append(candidate)
+
+    skip_field = object()
+    product_lookup_cache = {}
+    metaobject_definition_type_cache = {}
+    metaobject_lookup_cache = {}
+
+    def _graphql_post(query, variables=None, purpose="(unspecified)"):
+        payload = {"query": query, "variables": variables or {}}
+        try:
+            response = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as exc:
+            print(f"GraphQL {purpose} request failed: {exc}")
+            return None
+        except ValueError as exc:
+            print(f"GraphQL {purpose} returned invalid JSON: {exc}")
+            return None
+
+        if data.get("errors"):
+            print(f"GraphQL {purpose} errors: {data['errors']}")
+        return data
+
+    def resolve_local_asset_path(filename):
+        return resolve_asset_from_directories(filename, asset_directories)
+
+    def has_cell_value(value):
+        if value is None:
+            return False
+        try:
+            if pd.isna(value):
+                return False
+        except TypeError:
+            pass
+        if isinstance(value, str):
+            return bool(value.strip())
+        return True
+
+    def get_cell_string(row_data, column_name):
+        value = row_data.get(column_name)
+        if not has_cell_value(value):
+            return ""
+        return format_metafield_text_value(value).strip()
+
+    def parse_bool_value(value):
+        if isinstance(value, bool):
+            return value
+        normalized_value = str(value).strip().lower()
+        if normalized_value in {"1", "true", "yes", "y", "published"}:
+            return True
+        if normalized_value in {"0", "false", "no", "n", "draft", "unpublished"}:
+            return False
+        return None
+
+    def normalize_datetime_value(value):
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime().isoformat()
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value).strip()
+
+    def parse_tags_value(value):
+        if not has_cell_value(value):
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        raw_value = str(value).strip()
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [item.strip() for item in re.split(r"[\n,;]+", raw_value) if item.strip()]
+
+    def normalize_reference_lookup_value(value):
+        if value is None:
+            return ""
+        return re.sub(r"\s+", " ", str(value)).strip().casefold()
+
+    def parse_reference_values(value):
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        try:
+            if pd.isna(value):
+                return []
+        except TypeError:
+            pass
+        raw_value = str(value).strip()
+        if not raw_value:
+            return []
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [item.strip() for item in re.split(r"[\n,;]+", raw_value) if item.strip()]
+
+    def parse_generic_list_value(value):
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return list(value)
+        try:
+            if pd.isna(value):
+                return []
+        except TypeError:
+            pass
+        raw_value = str(value).strip()
+        if not raw_value:
+            return []
+        if raw_value.startswith("["):
+            try:
+                parsed = json.loads(raw_value)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return parsed
+        return [item.strip() for item in re.split(r"[\n,;]+", raw_value) if item.strip()]
+
+    def normalize_scalar_value(field_type, value):
+        if isinstance(value, pd.Timestamp):
+            if field_type == "date":
+                return value.date().isoformat()
+            if field_type == "date_time":
+                return value.to_pydatetime().isoformat()
+            if field_type == "time":
+                return value.strftime("%H:%M:%S")
+            value = value.to_pydatetime()
+
+        if isinstance(value, datetime):
+            if field_type == "date":
+                return value.date().isoformat()
+            if field_type == "date_time":
+                return value.isoformat()
+            if field_type == "time":
+                return value.strftime("%H:%M:%S")
+
+        if field_type == "boolean":
+            parsed = parse_bool_value(value)
+            if parsed is not None:
+                return "true" if parsed else "false"
+            return str(value).strip()
+
+        if field_type in {"single_line_text_field", "multi_line_text_field"}:
+            return format_metafield_text_value(value)
+
+        if isinstance(value, bool):
+            return "true" if value else "false"
+
+        if isinstance(value, numbers.Number):
+            return format_metafield_text_value(value)
+
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+
+        return str(value).strip()
+
+    def extract_metafield_type_name(definition):
+        field_type = definition.get("type")
+        if isinstance(field_type, dict):
+            return (field_type.get("name") or "").strip()
+        return str(field_type or "").strip()
+
+    def fetch_article_metafield_definitions():
+        query = """
+        query ArticleMetafieldDefinitions($after: String) {
+          metafieldDefinitions(ownerType: ARTICLE, first: 250, after: $after) {
+            nodes {
+              id
+              name
+              namespace
+              key
+              type {
+                name
+              }
+              validations {
+                name
+                value
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        definitions = {}
+        cursor = None
+        has_next_page = True
+        while has_next_page:
+            data = _graphql_post(
+                query,
+                {"after": cursor},
+                purpose="Article metafield definitions lookup",
+            )
+            connection = (((data or {}).get("data") or {}).get("metafieldDefinitions") or {})
+            for definition in connection.get("nodes") or []:
+                namespace = definition.get("namespace") or ""
+                key = definition.get("key") or ""
+                if not namespace or not key:
+                    continue
+                definitions[(namespace, key)] = {
+                    "namespace": namespace,
+                    "key": key,
+                    "type": extract_metafield_type_name(definition),
+                    "validations": definition.get("validations") or [],
+                }
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        return definitions
+
+    def staged_upload_create(filename, mime_type):
+        query = """
+        mutation StagedUploadCreate($input: [StagedUploadInput!]!) {
+          stagedUploadsCreate(input: $input) {
+            stagedTargets {
+              url
+              parameters {
+                name
+                value
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        variables = {
+            "input": [
+                {
+                    "resource": "FILE",
+                    "filename": filename,
+                    "mimeType": mime_type,
+                    "httpMethod": "POST",
+                }
+            ]
+        }
+        data = _graphql_post(query, variables, purpose=f"Staged upload for {filename}")
+        payload = (((data or {}).get("data") or {}).get("stagedUploadsCreate") or {})
+        user_errors = payload.get("userErrors") or []
+        if user_errors:
+            print(f"Staged upload creation failed for {filename}: {user_errors}")
+            return None
+        staged_targets = payload.get("stagedTargets") or []
+        return staged_targets[0] if staged_targets else None
+
+    def upload_file_to_staging(staging_target, file_path):
+        url = staging_target["url"]
+        form_data = {param["name"]: param["value"] for param in staging_target["parameters"]}
+        try:
+            with open(file_path, "rb") as file_handle:
+                response = requests.post(url, data=form_data, files={"file": file_handle})
+        except OSError as exc:
+            print(f"Failed to read file '{file_path}' for staged upload: {exc}")
+            return None
+        except requests.RequestException as exc:
+            print(f"Failed to upload '{file_path}' to the staged URL: {exc}")
+            return None
+
+        if response.status_code == 201:
+            try:
+                xml_response = ET.fromstring(response.text)
+                location_node = xml_response.find('Location')
+                return location_node.text if location_node is not None else None
+            except ET.ParseError as exc:
+                print(f"Could not parse staged upload response for '{file_path}': {exc}")
+                return None
+
+        print(f"Failed to upload '{file_path}' to staging. Status: {response.status_code}, {response.text}")
+        return None
+
+    def commit_file_to_shopify(file_name, original_source):
+        query = """
+        mutation FileCreate($files: [FileCreateInput!]!) {
+          fileCreate(files: $files) {
+            files {
+              id
+              alt
+              ... on GenericFile {
+                url
+              }
+              ... on MediaImage {
+                image {
+                  url
+                }
+              }
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """
+        variables = {
+            "files": [
+                {
+                    "alt": file_name,
+                    "originalSource": original_source
+                }
+            ]
+        }
+        data = _graphql_post(query, variables, purpose=f"fileCreate for {file_name}")
+        payload = (((data or {}).get("data") or {}).get("fileCreate") or {})
+        user_errors = payload.get("userErrors") or []
+        if user_errors:
+            print(f"fileCreate failed for {file_name}: {user_errors}")
+            return None
+        files = payload.get("files") or []
+        return files[0] if files else None
+
+    def get_image_url_for_gid(gid):
+        query = """
+        query FileNode($id: ID!) {
+          node(id: $id) {
+            ... on GenericFile {
+              url
+            }
+            ... on MediaImage {
+              image {
+                url
+              }
+            }
+          }
+        }
+        """
+        data = _graphql_post(query, {"id": gid}, purpose=f"File URL lookup for {gid}")
+        node = (((data or {}).get("data") or {}).get("node") or {})
+        if node.get("url"):
+            return node.get("url")
+        image = node.get("image") or {}
+        return image.get("url")
+
+    def upload_file_to_shopify(file_path):
+        filename = os.path.basename(file_path)
+        normalized_filename = normalize_filename(filename)
+        normalized_path = os.path.join(os.path.dirname(file_path), normalized_filename)
+
+        if not os.path.exists(normalized_path):
+            print(f"File '{normalized_filename}' was not found.")
+            return None, None
+
+        mime_type = guess_mime_type(filename)
+        staged_target = staged_upload_create(filename, mime_type)
+        if not staged_target:
+            return None, None
+        location_url = upload_file_to_staging(staged_target, normalized_path)
+        if not location_url:
+            return None, None
+        file_info = commit_file_to_shopify(filename, location_url)
+        if not file_info:
+            return None, None
+        gid = file_info.get("id")
+        url = file_info.get("url")
+        if not url and file_info.get("image"):
+            url = (file_info.get("image") or {}).get("url")
+        if not url and gid:
+            url = get_image_url_for_gid(gid)
+        return url, gid
+
+    def get_all_files():
+        all_files = {}
+        query = """
+        query Files($after: String) {
+          files(first: 250, after: $after) {
+            edges {
+              node {
+                id
+                alt
+                ... on GenericFile {
+                  url
+                }
+                ... on MediaImage {
+                  image {
+                    url
+                  }
+                }
+              }
+              cursor
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        cursor = None
+        has_next_page = True
+        while has_next_page:
+            data = _graphql_post(query, {"after": cursor}, purpose="Shopify files lookup")
+            connection = (((data or {}).get("data") or {}).get("files") or {})
+            for edge in connection.get("edges") or []:
+                node = edge.get("node") or {}
+                gid = node.get("id")
+                alt = node.get("alt")
+                url = node.get("url") or ((node.get("image") or {}).get("url"))
+                if alt:
+                    remember_file_reference(all_files, alt, gid, url)
+                filename = extract_filename_from_value(url)
+                if filename:
+                    remember_file_reference(all_files, filename, gid, url)
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        return all_files
+
+    def get_metaobject_definition_type_from_gid(definition_gid):
+        if definition_gid in metaobject_definition_type_cache:
+            return metaobject_definition_type_cache[definition_gid]
+
+        query = """
+        query MetaobjectDefinitionById($id: ID!) {
+          node(id: $id) {
+            ... on MetaobjectDefinition {
+              id
+              type
+            }
+          }
+        }
+        """
+        data = _graphql_post(
+            query,
+            {"id": definition_gid},
+            purpose=f"Metaobject definition lookup for {definition_gid}",
+        )
+        definition_type = ((((data or {}).get("data") or {}).get("node") or {}).get("type"))
+        metaobject_definition_type_cache[definition_gid] = definition_type
+        return definition_type
+
+    def get_target_metaobject_type(field_definition):
+        definition_gid = None
+        metaobject_type = None
+
+        for validation in field_definition.get("validations") or []:
+            validation_name = (validation.get("name") or "").strip().lower()
+            if "metaobject_definition" not in validation_name:
+                continue
+
+            for candidate in parse_reference_values(validation.get("value")):
+                if candidate.startswith("gid://shopify/MetaobjectDefinition/"):
+                    definition_gid = candidate
+                    break
+                if candidate and not metaobject_type:
+                    metaobject_type = candidate
+            if definition_gid:
+                break
+
+        if definition_gid and not metaobject_type:
+            metaobject_type = get_metaobject_definition_type_from_gid(definition_gid)
+
+        return metaobject_type
+
+    def add_metaobject_lookup_candidate(lookup, raw_value, entry):
+        normalized_value = normalize_reference_lookup_value(raw_value)
+        if not normalized_value:
+            return
+
+        matches = lookup.setdefault(normalized_value, [])
+        if all(existing["id"] != entry["id"] for existing in matches):
+            matches.append(entry)
+
+    def get_metaobject_lookup(metaobject_type):
+        if metaobject_type in metaobject_lookup_cache:
+            return metaobject_lookup_cache[metaobject_type]
+
+        query = """
+        query MetaobjectsByType($type: String!, $after: String) {
+          metaobjects(type: $type, first: 250, after: $after) {
+            nodes {
+              id
+              displayName
+              handle
+              fields {
+                key
+                value
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        lookup = {}
+        cursor = None
+        has_next_page = True
+        while has_next_page:
+            data = _graphql_post(
+                query,
+                {"type": metaobject_type, "after": cursor},
+                purpose=f"Metaobjects lookup for type {metaobject_type}",
+            )
+            connection = (((data or {}).get("data") or {}).get("metaobjects") or {})
+            nodes = connection.get("nodes") or []
+            for node in nodes:
+                metaobject_id = node.get("id")
+                if not metaobject_id:
+                    continue
+                entry = {
+                    "id": metaobject_id,
+                    "display_name": node.get("displayName") or "",
+                    "handle": node.get("handle") or "",
+                }
+                add_metaobject_lookup_candidate(lookup, entry["display_name"], entry)
+                add_metaobject_lookup_candidate(lookup, entry["handle"], entry)
+                for field in node.get("fields") or []:
+                    field_key = (field.get("key") or "").strip().lower()
+                    field_value = field.get("value")
+                    if field_key in {"title", "name", "label"} and field_value:
+                        add_metaobject_lookup_candidate(lookup, field_value, entry)
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        metaobject_lookup_cache[metaobject_type] = lookup
+        return lookup
+
+    def resolve_metaobject_reference_gid(field_definition, raw_value):
+        if isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+
+        if not raw_value:
+            return None
+        if isinstance(raw_value, str) and raw_value.startswith("gid://shopify/Metaobject/"):
+            return raw_value
+
+        target_metaobject_type = get_target_metaobject_type(field_definition)
+        if not target_metaobject_type:
+            print(f"Could not determine which metaobject type field '{field_definition.get('key')}' references.")
+            return None
+
+        lookup = get_metaobject_lookup(target_metaobject_type)
+        matches = lookup.get(normalize_reference_lookup_value(raw_value), [])
+        if len(matches) == 1:
+            return matches[0]["id"]
+        if len(matches) > 1:
+            options = ", ".join(
+                match.get("display_name") or match.get("handle") or match.get("id")
+                for match in matches
+            )
+            print(f"Metaobject value '{raw_value}' is ambiguous for field '{field_definition.get('key')}'. Matches: {options}")
+            return None
+
+        print(f"Could not resolve metaobject value '{raw_value}' for field '{field_definition.get('key')}'.")
+        return None
+
+    def extract_product_handle_candidate(raw_value):
+        raw_text = str(raw_value or "").strip()
+        parsed = urllib.parse.urlparse(raw_text)
+        if parsed.scheme and "/products/" in parsed.path:
+            handle = parsed.path.split("/products/", 1)[1].strip("/").split("/", 1)[0]
+            if handle:
+                return handle
+
+        bracket_match = re.search(r"\(([^()]+)\)\s*$", raw_text)
+        if bracket_match:
+            return bracket_match.group(1).strip()
+
+        if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", raw_text):
+            return raw_text
+
+        return None
+
+    def search_products(search_query):
+        query = """
+        query ProductLookup($query: String!) {
+          products(first: 10, query: $query) {
+            nodes {
+              id
+              title
+              handle
+            }
+          }
+        }
+        """
+        data = _graphql_post(query, {"query": search_query}, purpose=f"Product lookup '{search_query}'")
+        return ((((data or {}).get("data") or {}).get("products") or {}).get("nodes") or [])
+
+    def resolve_product_reference_gid(raw_value):
+        if isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+
+        if not raw_value:
+            return None
+        if isinstance(raw_value, str) and raw_value.startswith("gid://shopify/Product/"):
+            return raw_value
+
+        normalized_value = normalize_reference_lookup_value(raw_value)
+        if normalized_value in product_lookup_cache:
+            return product_lookup_cache[normalized_value]
+
+        handle_candidate = extract_product_handle_candidate(raw_value)
+        if handle_candidate:
+            matches = search_products(f"handle:{handle_candidate}")
+            exact_matches = [
+                product for product in matches
+                if normalize_reference_lookup_value(product.get("handle")) == normalize_reference_lookup_value(handle_candidate)
+            ]
+            if len(exact_matches) == 1:
+                product_lookup_cache[normalized_value] = exact_matches[0]["id"]
+                return exact_matches[0]["id"]
+
+        matches = search_products(str(raw_value).strip())
+        exact_matches = [
+            product for product in matches
+            if normalize_reference_lookup_value(product.get("title")) == normalized_value
+            or normalize_reference_lookup_value(product.get("handle")) == normalized_value
+        ]
+
+        if len(exact_matches) == 1:
+            product_lookup_cache[normalized_value] = exact_matches[0]["id"]
+            return exact_matches[0]["id"]
+
+        if len(exact_matches) > 1:
+            options = ", ".join(product.get("handle") or product.get("title") or product.get("id") for product in exact_matches)
+            print(f"Product value '{raw_value}' is ambiguous. Matches: {options}")
+            return None
+
+        print(f"Could not resolve product reference value '{raw_value}'. Use a product GID or unique product handle/title.")
+        return None
+
+    def resolve_file_reference_gid(raw_value, existing_files, row_index, df, column_name, field_key):
+        if not isinstance(raw_value, str):
+            raw_value = str(raw_value)
+        candidate = raw_value.strip()
+        filename = extract_filename_from_value(candidate)
+
+        if candidate.startswith('gid://'):
+            return candidate
+
+        existing_entry = fetch_file_reference(existing_files, filename)
+        if candidate.startswith('http'):
+            if existing_entry:
+                set_dataframe_cell(df, row_index, column_name, existing_entry[1] or candidate)
+                return existing_entry[0]
+            print(f"Could not match Shopify file URL '{candidate}' to an existing file for field '{field_key}'.")
+            return None
+
+        if existing_entry:
+            set_dataframe_cell(df, row_index, column_name, existing_entry[1] or existing_entry[0])
+            return existing_entry[0]
+
+        file_path_local = resolve_local_asset_path(candidate)
+        if not file_path_local:
+            print(f"File '{candidate}' was not found locally for field '{field_key}'.")
+            return None
+
+        url, gid = upload_file_to_shopify(file_path_local)
+        if not gid:
+            print(f"Failed to upload file '{candidate}' for field '{field_key}'.")
+            return None
+
+        remember_file_reference(existing_files, filename or candidate, gid, url)
+        set_dataframe_cell(df, row_index, column_name, url or gid)
+        return gid
+
+    def resolve_metafield_value(field_definition, raw_value, existing_files, row_index, df, column_name):
+        field_type = (field_definition.get("type") or "").strip()
+        field_key = field_definition.get("key")
+
+        if not has_cell_value(raw_value):
+            return skip_field
+
+        if field_type == "file_reference":
+            return resolve_file_reference_gid(raw_value, existing_files, row_index, df, column_name, field_key)
+
+        if field_type == "list.file_reference":
+            file_gids = []
+            for item in parse_reference_values(raw_value):
+                resolved_gid = resolve_file_reference_gid(item, existing_files, row_index, df, column_name, field_key)
+                if not resolved_gid:
+                    return None
+                file_gids.append(resolved_gid)
+            return json.dumps(file_gids, ensure_ascii=False)
+
+        if field_type == "metaobject_reference":
+            return resolve_metaobject_reference_gid(field_definition, raw_value)
+
+        if field_type == "list.metaobject_reference":
+            resolved_gids = []
+            seen = set()
+            for item in parse_reference_values(raw_value):
+                resolved_gid = resolve_metaobject_reference_gid(field_definition, item)
+                if not resolved_gid:
+                    return None
+                if resolved_gid not in seen:
+                    seen.add(resolved_gid)
+                    resolved_gids.append(resolved_gid)
+            return json.dumps(resolved_gids, ensure_ascii=False)
+
+        if field_type == "product_reference":
+            return resolve_product_reference_gid(raw_value)
+
+        if field_type == "list.product_reference":
+            resolved_gids = []
+            seen = set()
+            for item in parse_reference_values(raw_value):
+                resolved_gid = resolve_product_reference_gid(item)
+                if not resolved_gid:
+                    return None
+                if resolved_gid not in seen:
+                    seen.add(resolved_gid)
+                    resolved_gids.append(resolved_gid)
+            return json.dumps(resolved_gids, ensure_ascii=False)
+
+        if field_type == "rich_text_field":
+            if isinstance(raw_value, str):
+                stripped_value = raw_value.strip()
+                if "<" in stripped_value and ">" in stripped_value:
+                    return json.dumps(html_to_shopify_json(stripped_value), ensure_ascii=False)
+                return stripped_value
+            return json.dumps(raw_value, ensure_ascii=False)
+
+        if field_type.startswith("list."):
+            return json.dumps(parse_generic_list_value(raw_value), ensure_ascii=False)
+
+        if field_type == "json" and isinstance(raw_value, (dict, list)):
+            return json.dumps(raw_value, ensure_ascii=False)
+
+        return normalize_scalar_value(field_type, raw_value)
+
+    def parse_metafield_column(column_name):
+        match = re.match(r"^Metafield:\s+(.+)\.([^.\s]+)\s+\[(.+)\]$", column_name)
+        if not match:
+            return None
+        return {
+            "namespace": match.group(1).strip(),
+            "key": match.group(2).strip(),
+            "type": match.group(3).strip(),
+        }
+
+    def build_article_input(row_data, is_create):
+        article_input = {}
+
+        if is_create:
+            blog_id = get_cell_string(row_data, "Blog ID")
+            if not blog_id:
+                return None, "Blog ID is required when creating a new article row."
+            article_input["blogId"] = blog_id
+
+        if "Title" in row_data:
+            title = get_cell_string(row_data, "Title")
+            if title:
+                article_input["title"] = title
+            elif is_create:
+                return None, "Title is required when creating a new article row."
+
+        for column_name, input_key in [
+            ("Handle", "handle"),
+            ("Body HTML", "body"),
+            ("Summary HTML", "summary"),
+            ("Template Suffix", "templateSuffix"),
+        ]:
+            if column_name in row_data:
+                article_input[input_key] = get_cell_string(row_data, column_name)
+
+        if "Tags" in row_data:
+            article_input["tags"] = parse_tags_value(row_data.get("Tags"))
+
+        if "Published" in row_data and has_cell_value(row_data.get("Published")):
+            parsed_published = parse_bool_value(row_data.get("Published"))
+            if parsed_published is not None:
+                article_input["isPublished"] = parsed_published
+            else:
+                print(f"Ignoring invalid Published value '{row_data.get('Published')}'. Use yes/no.")
+
+        if "Published At" in row_data and has_cell_value(row_data.get("Published At")):
+            article_input["publishDate"] = normalize_datetime_value(row_data.get("Published At"))
+
+        author_name = get_cell_string(row_data, "Author") if "Author" in row_data else ""
+        if author_name:
+            article_input["author"] = {"name": author_name}
+
+        image_input = {}
+        image_url = get_cell_string(row_data, "Image URL") if "Image URL" in row_data else ""
+        image_alt = get_cell_string(row_data, "Image Alt Text") if "Image Alt Text" in row_data else ""
+        if image_url:
+            image_input["url"] = image_url
+        if image_alt:
+            image_input["altText"] = image_alt
+        if image_input:
+            article_input["image"] = image_input
+
+        if "handle" in article_input:
+            article_input["redirectNewHandle"] = True
+
+        return article_input, None
+
+    def create_article(article_input):
+        mutation = """
+        mutation ArticleCreate($article: ArticleCreateInput!) {
+          articleCreate(article: $article) {
+            article {
+              id
+              title
+              handle
+              updatedAt
+              blog {
+                id
+                title
+                handle
+              }
+            }
+            userErrors {
+              code
+              field
+              message
+            }
+          }
+        }
+        """
+        data = _graphql_post(mutation, {"article": article_input}, purpose="Article create")
+        payload = (((data or {}).get("data") or {}).get("articleCreate") or {})
+        return payload.get("article"), payload.get("userErrors") or []
+
+    def update_article(article_id, article_input):
+        mutation = """
+        mutation ArticleUpdate($id: ID!, $article: ArticleUpdateInput!) {
+          articleUpdate(id: $id, article: $article) {
+            article {
+              id
+              title
+              handle
+              updatedAt
+              blog {
+                id
+                title
+                handle
+              }
+            }
+            userErrors {
+              code
+              field
+              message
+            }
+          }
+        }
+        """
+        data = _graphql_post(
+            mutation,
+            {"id": article_id, "article": article_input},
+            purpose=f"Article update {article_id}",
+        )
+        payload = (((data or {}).get("data") or {}).get("articleUpdate") or {})
+        return payload.get("article"), payload.get("userErrors") or []
+
+    def set_article_metafields(metafields):
+        mutation = """
+        mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields {
+              id
+              namespace
+              key
+              value
+            }
+            userErrors {
+              field
+              message
+              code
+            }
+          }
+        }
+        """
+
+        all_user_errors = []
+        for start in range(0, len(metafields), 25):
+            chunk = metafields[start:start + 25]
+            data = _graphql_post(mutation, {"metafields": chunk}, purpose="Article metafieldsSet")
+            payload = (((data or {}).get("data") or {}).get("metafieldsSet") or {})
+            all_user_errors.extend(payload.get("userErrors") or [])
+        return all_user_errors
+
+    if not file_path:
+        ensure_tkinter_available()
+        root = tk.Tk()
+        root.withdraw()
+        file_path = filedialog.askopenfilename(
+            title="Select Blog Entries Excel File",
+            filetypes=[("Excel files", "*.xlsx")]
+        )
+    if not file_path:
+        print("No file selected.")
+        return None
+
+    print(f"Reading blog entries from file: {file_path}")
+    df = pd.read_excel(file_path)
+    df = df.where(pd.notnull(df), None)
+
+    metafield_definitions = fetch_article_metafield_definitions()
+    metafield_columns = []
+    for column_name in df.columns:
+        parsed_column = parse_metafield_column(column_name)
+        if not parsed_column:
+            continue
+
+        definition_key = (parsed_column["namespace"], parsed_column["key"])
+        field_definition = metafield_definitions.get(definition_key, parsed_column)
+        field_definition = {
+            "namespace": parsed_column["namespace"],
+            "key": parsed_column["key"],
+            "type": field_definition.get("type") or parsed_column["type"],
+            "validations": field_definition.get("validations") or [],
+        }
+        metafield_columns.append((column_name, field_definition))
+
+    print("Fetching existing Shopify files for file-reference fields...")
+    existing_files = get_all_files() or {}
+    print(f"Retrieved {len(existing_files)} existing Shopify file references.")
+
+    for index, row in df.iterrows():
+        row_data = row.to_dict()
+        article_id = get_cell_string(row_data, "ID")
+        is_create = not bool(article_id)
+
+        article_input, article_error = build_article_input(row_data, is_create)
+        if article_error:
+            print(f"Skipping row {index + 2}: {article_error}")
+            continue
+
+        article = None
+        user_errors = []
+        if is_create:
+            article, user_errors = create_article(article_input)
+        elif article_input:
+            article, user_errors = update_article(article_id, article_input)
+
+        if user_errors:
+            print(f"Shopify returned article user errors for row {index + 2}: {user_errors}")
+            continue
+
+        if article:
+            article_id = article.get("id") or article_id
+            set_dataframe_cell(df, index, "ID", article_id)
+            set_dataframe_cell(df, index, "Title", article.get("title"))
+            set_dataframe_cell(df, index, "Handle", article.get("handle"))
+            set_dataframe_cell(df, index, "Updated At", article.get("updatedAt"))
+            blog = article.get("blog") or {}
+            if blog:
+                set_dataframe_cell(df, index, "Blog ID", blog.get("id"))
+                set_dataframe_cell(df, index, "Blog Title", blog.get("title"))
+                set_dataframe_cell(df, index, "Blog Handle", blog.get("handle"))
+
+        if not article_id:
+            print(f"Skipping metafields for row {index + 2} because no article ID is available.")
+            continue
+
+        metafield_inputs = []
+        for column_name, field_definition in metafield_columns:
+            raw_value = row_data.get(column_name)
+            resolved_value = resolve_metafield_value(
+                field_definition,
+                raw_value,
+                existing_files,
+                index,
+                df,
+                column_name,
+            )
+            if resolved_value is skip_field:
+                continue
+            if resolved_value is None:
+                print(
+                    f"Skipping metafield '{field_definition['namespace']}.{field_definition['key']}' "
+                    f"for row {index + 2} because its value could not be resolved."
+                )
+                continue
+
+            metafield_inputs.append(
+                {
+                    "ownerId": article_id,
+                    "namespace": field_definition["namespace"],
+                    "key": field_definition["key"],
+                    "type": field_definition["type"],
+                    "value": resolved_value,
+                }
+            )
+
+        if metafield_inputs:
+            metafield_errors = set_article_metafields(metafield_inputs)
+            if metafield_errors:
+                print(f"Shopify returned metafield user errors for row {index + 2}: {metafield_errors}")
+            else:
+                print(f"Updated {len(metafield_inputs)} metafields for row {index + 2}.")
+
+        print(f"Blog entry processed for row {index + 2}: {article_id}")
+
+    df.to_excel(file_path, index=False)
+    print("Blog entries upload completed and the spreadsheet was updated with the latest IDs and handles.")
+    return file_path
+
+
 def start_download():
     def after_download():
         download_button.config(state=tk.NORMAL)
@@ -6739,10 +8375,10 @@ def start_collection_download():
     def after_collection_download():
         collection_download_button.config(state=tk.NORMAL)
         collection_upload_button.config(state=tk.NORMAL)
-    
+
     collection_download_button.config(state=tk.DISABLED)
     collection_upload_button.config(state=tk.DISABLED)
-    
+
     thread = build_safe_thread("Collection download", collection_run_downloader_logic)
     thread.start()
     root.after(100, check_thread, thread, after_collection_download, "Download completed!")
@@ -6751,10 +8387,10 @@ def start_collection_upload():
     def after_collection_upload():
         collection_download_button.config(state=tk.NORMAL)
         collection_upload_button.config(state=tk.NORMAL)
-    
+
     collection_download_button.config(state=tk.DISABLED)
     collection_upload_button.config(state=tk.DISABLED)
-    
+
     thread = build_safe_thread("Collection upload", collection_run_uploader_logic)
     thread.start()
     root.after(100, check_thread, thread, after_collection_upload, "Upload completed!")
@@ -6784,6 +8420,33 @@ def start_metaobject_upload():
     thread = build_safe_thread("Metaobject upload", metaobject_run_uploader_logic)
     thread.start()
     root.after(100, check_thread, thread, after_metaobject_upload, "Metaobjects upload completed!")
+
+
+def start_blog_entries_download():
+    def after_blog_entries_download():
+        blog_entries_download_button.config(state=tk.NORMAL)
+        blog_entries_upload_button.config(state=tk.NORMAL)
+
+    blog_entries_download_button.config(state=tk.DISABLED)
+    blog_entries_upload_button.config(state=tk.DISABLED)
+
+    thread = build_safe_thread("Blog entries download", blog_entries_run_downloader_logic)
+    thread.start()
+    root.after(100, check_thread, thread, after_blog_entries_download, "Blog entries download completed!")
+
+
+def start_blog_entries_upload():
+    def after_blog_entries_upload():
+        blog_entries_download_button.config(state=tk.NORMAL)
+        blog_entries_upload_button.config(state=tk.NORMAL)
+
+    blog_entries_download_button.config(state=tk.DISABLED)
+    blog_entries_upload_button.config(state=tk.DISABLED)
+
+    thread = build_safe_thread("Blog entries upload", blog_entries_run_uploader_logic)
+    thread.start()
+    root.after(100, check_thread, thread, after_blog_entries_upload, "Blog entries upload completed!")
+
 
 def download_shopify_files_alt_texts(shopify_context=None, script_dir=None, output_dir=None):
     script_dir = resolve_runtime_script_dir(script_dir)
@@ -6875,7 +8538,7 @@ def download_shopify_files_alt_texts(shopify_context=None, script_dir=None, outp
         has_next_page = bool((files_connection.get('pageInfo') or {}).get('hasNextPage'))
         if has_next_page:
             cursor = files[-1]['cursor']
-    
+
     resolved_output_dir = os.path.abspath(output_dir or script_dir)
     os.makedirs(resolved_output_dir, exist_ok=True)
 
@@ -7185,6 +8848,8 @@ def main():
     global metaobject_upload_button
     global file_alt_download_button
     global file_alt_upload_button
+    global blog_entries_download_button
+    global blog_entries_upload_button
     global seo_alt_text_button
 
     root = tk.Tk()
@@ -7228,8 +8893,14 @@ def main():
     file_alt_upload_button = tk.Button(root, text="Upload Files Alt Texts", command=lambda: start_detached_task("Upload Files Alt Texts", upload_shopify_files_alt_texts), width=25, height=2)
     file_alt_upload_button.grid(row=4, column=1, pady=5)
 
+    blog_entries_download_button = tk.Button(root, text="Download Blog Entries", command=start_blog_entries_download, width=25, height=2)
+    blog_entries_download_button.grid(row=5, column=0, pady=5)
+
+    blog_entries_upload_button = tk.Button(root, text="Upload Blog Entries", command=start_blog_entries_upload, width=25, height=2)
+    blog_entries_upload_button.grid(row=5, column=1, pady=5)
+
     seo_alt_text_button = tk.Button(root, text="Generate SEO Alt Texts (AI)", command=lambda: start_detached_task("Generate SEO Alt Texts (AI)", generate_seo_alt_texts), width=30, height=2)
-    seo_alt_text_button.grid(row=5, column=0, columnspan=2, pady=5)
+    seo_alt_text_button.grid(row=6, column=0, columnspan=2, pady=5)
 
     # Set window size
     root.geometry("540x780")

@@ -1,12 +1,19 @@
-# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+# ORIOR-specific Shopify app config.
+# Before first use, replace:
+# - client_id
+# - application_url
+# - redirect_urls
+# This app should be deployed to its own hosted instance because the runtime
+# only supports one SHOPIFY_API_KEY / SHOPIFY_API_SECRET pair at a time.
 
-client_id = "ad4763aa9e119e137fecb4a4cfa918cb"
-name = "HUX Bulk Loader"
-application_url = "https://hux-bulk-loader.onrender.com"
+client_id = "REPLACE_WITH_ORIOR_CLIENT_ID"
+name = "ORIOR Bulk Loader"
+application_url = "https://REPLACE_WITH_ORIOR_HOSTNAME"
 embedded = true
 
 [build]
 automatically_update_urls_on_dev = true
+include_config_on_deploy = true
 
 [webhooks]
 api_version = "2026-07"
@@ -20,10 +27,9 @@ api_version = "2026-07"
   uri = "/webhooks/app/uninstalled"
 
 [access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_files,write_files,read_content,write_content,write_inventory,read_inventory,read_locations,read_metaobject_definitions,read_metaobjects,write_metaobjects,read_products,write_products"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = [ "https://hux-bulk-loader.onrender.com/auth/callback" ]
+redirect_urls = [ "https://REPLACE_WITH_ORIOR_HOSTNAME/auth/callback" ]

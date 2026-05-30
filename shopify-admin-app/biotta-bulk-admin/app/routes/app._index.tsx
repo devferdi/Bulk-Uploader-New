@@ -18,7 +18,8 @@ type ModuleId =
   | "products"
   | "metaobjects"
   | "collections"
-  | "file-alt-texts";
+  | "file-alt-texts"
+  | "blog-entries";
 type BulkJobAction = "download" | "upload";
 type BulkJobStatus = "queued" | "running" | "completed" | "failed";
 type BulkJobSummary = {
@@ -185,6 +186,35 @@ const BULK_WORKFLOW_MODULES: BulkWorkflowModule[] = [
     downloadSuccessMessage: "Files alt-text spreadsheet downloaded",
     uploadSuccessMessage:
       "Upload complete. Updated files alt-text spreadsheet downloaded",
+  },
+  {
+    id: "blog-entries",
+    kicker: "Blog entries",
+    title: "Article metafields workbook",
+    summary:
+      "Blog articles, body content, publishing data, and dynamic metafields.",
+    downloadDescription:
+      "Export the current blog entries into XLSX.",
+    uploadDescription:
+      "Upload the workbook to sync article content and metafields.",
+    dropZoneLabel: "Blog entries spreadsheet",
+    downloadButtonLabel: "Download workbook",
+    uploadButtonLabel: "Upload workbook",
+    downloadEndpoint: "/app/blog-entries/download",
+    uploadEndpoint: "/app/blog-entries/upload",
+    jobRouteBasePath: "/app/bulk-jobs",
+    fileRouteBasePath: "/app/bulk-jobs",
+    defaultDownloadFileName: "shopify_blog_entries.xlsx",
+    defaultUploadFileName: "shopify_blog_entries_updated.xlsx",
+    downloadStartError: "Could not start the blog entries download job.",
+    downloadFinishedError: "Could not finish the blog entries download job.",
+    uploadStartError: "Could not start the blog entries upload job.",
+    uploadFinishedError: "Could not finish the blog entries upload job.",
+    workerFileDownloadError:
+      "Could not download the completed blog entries spreadsheet.",
+    downloadSuccessMessage: "Blog entries spreadsheet downloaded",
+    uploadSuccessMessage:
+      "Upload complete. Updated blog entries spreadsheet downloaded",
   },
 ];
 
@@ -381,6 +411,11 @@ function createInitialWorkflowState(): WorkflowState {
       selectedFile: null,
     },
     "file-alt-texts": {
+      isDownloading: false,
+      isUploading: false,
+      selectedFile: null,
+    },
+    "blog-entries": {
       isDownloading: false,
       isUploading: false,
       selectedFile: null,

@@ -53,7 +53,8 @@ type BulkResource =
   | "products"
   | "metaobjects"
   | "collections"
-  | "file-alt-texts";
+  | "file-alt-texts"
+  | "blog-entries";
 type ProductJobAction = "download" | "upload";
 type ProductWorkerAction =
   | "products-download"
@@ -63,7 +64,9 @@ type ProductWorkerAction =
   | "collections-download"
   | "collections-upload"
   | "file-alt-texts-download"
-  | "file-alt-texts-upload";
+  | "file-alt-texts-upload"
+  | "blog-entries-download"
+  | "blog-entries-upload";
 type ProductJobStatus = "queued" | "running" | "completed" | "failed";
 
 type ProductWorkerResult = {
@@ -546,6 +549,16 @@ export async function startFileAltTextsDownloadJob(
 
 export async function startFileAltTextsUploadJob(options: ProductUploadOptions) {
   return startBulkUploadJob("file-alt-texts", options);
+}
+
+export async function startBlogEntriesDownloadJob(
+  options: ProductSpreadsheetOptions,
+) {
+  return startBulkDownloadJob("blog-entries", options);
+}
+
+export async function startBlogEntriesUploadJob(options: ProductUploadOptions) {
+  return startBulkUploadJob("blog-entries", options);
 }
 
 export async function getProductJobSummary(jobId: string) {
