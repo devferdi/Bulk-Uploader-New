@@ -609,7 +609,7 @@ def run_downloader_logic(shopify_context=None, script_dir=None, output_dir=None)
     granted_access_scopes = set(shopify_context.get("granted_access_scopes") or [])
     log_shopify_access_scope_diagnostics(
         shopify_context,
-        required_scopes=["read_products", "read_locations", "read_inventory", "read_metaobjects"],
+        required_scopes=["read_products", "read_locations", "read_inventory", "read_metaobjects", "read_content"],
     )
 
     # Shopify API URL
@@ -623,7 +623,9 @@ def run_downloader_logic(shopify_context=None, script_dir=None, output_dir=None)
     }
 
     metaobject_label_cache = {}
+    article_label_cache = {}
     warned_missing_metaobject_scope = False
+    warned_missing_article_scope = False
 
     def parse_metaobject_reference_values(value):
         if isinstance(value, list):
@@ -730,6 +732,75 @@ def run_downloader_logic(shopify_context=None, script_dir=None, output_dir=None)
         metaobject_label_cache[metaobject_gid] = resolved_label
         return resolved_label
 
+    def get_article_display_label(article_gid):
+        nonlocal warned_missing_article_scope
+
+        if not article_gid:
+            return article_gid
+
+        if article_gid in article_label_cache:
+            return article_label_cache[article_gid]
+
+        if granted_access_scopes and "read_content" not in granted_access_scopes:
+            if not warned_missing_article_scope:
+                print(
+                    "⚠️ Current Shopify token does not include `read_content`, "
+                    "so article references will be exported as raw GIDs."
+                )
+                warned_missing_article_scope = True
+            article_label_cache[article_gid] = article_gid
+            return article_gid
+
+        query = """
+        query ArticleNode($id: ID!) {
+          node(id: $id) {
+            ... on Article {
+              id
+              title
+              handle
+              blog {
+                handle
+              }
+            }
+          }
+        }
+        """
+
+        try:
+            response = requests.post(
+                GRAPHQL_URL,
+                headers=headers,
+                json={"query": query, "variables": {"id": article_gid}},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            print(f"⚠️ Failed to resolve article {article_gid}: {exc}")
+            article_label_cache[article_gid] = article_gid
+            return article_gid
+        except ValueError as exc:
+            print(f"⚠️ Failed to parse article lookup response for {article_gid}: {exc}")
+            article_label_cache[article_gid] = article_gid
+            return article_gid
+
+        errors = payload.get("errors") or []
+        if errors:
+            print(f"⚠️ GraphQL article lookup errors for {article_gid}: {errors}")
+            article_label_cache[article_gid] = article_gid
+            return article_gid
+
+        node = ((payload.get("data") or {}).get("node") or {})
+        article_handle = node.get("handle")
+        blog_handle = ((node.get("blog") or {}).get("handle"))
+        if blog_handle and article_handle:
+            resolved_label = f"{blog_handle}/{article_handle}"
+        else:
+            resolved_label = article_handle or node.get("title") or article_gid
+
+        article_label_cache[article_gid] = resolved_label
+        return resolved_label
+
     def resolve_downloaded_metafield_value(metafield):
         field_type = (metafield.get("type") or "").strip().lower()
         raw_value = metafield.get("value")
@@ -746,6 +817,22 @@ def run_downloader_logic(shopify_context=None, script_dir=None, output_dir=None)
                 return raw_value
             resolved_values = [
                 get_metaobject_display_label(reference_value)
+                for reference_value in reference_values
+            ]
+            resolved_values = [value for value in resolved_values if value]
+            if not resolved_values:
+                return raw_value
+            return ", ".join(resolved_values)
+
+        if field_type == "article_reference":
+            return get_article_display_label(str(raw_value).strip())
+
+        if field_type == "list.article_reference":
+            reference_values = parse_metaobject_reference_values(raw_value)
+            if not reference_values:
+                return raw_value
+            resolved_values = [
+                get_article_display_label(reference_value)
                 for reference_value in reference_values
             ]
             resolved_values = [value for value in resolved_values if value]
@@ -1284,6 +1371,7 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
     metaobject_definition_cache = {}
     metaobject_lookup_cache = {}
     metaobject_known_reference_cache = {}
+    article_lookup_cache = {}
     owner_summary_cache = {}
 
     def normalize_metaobject_lookup_value(value):
@@ -1778,6 +1866,134 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
 
         for raw_item in parse_metaobject_reference_values(value):
             resolved_gid = resolve_metaobject_reference_gid(owner_type, namespace, key, raw_item)
+            if not resolved_gid:
+                return None
+            if resolved_gid not in seen:
+                seen.add(resolved_gid)
+                resolved_gids.append(resolved_gid)
+
+        return resolved_gids
+
+    def extract_article_reference_candidate(raw_value):
+        raw_text = str(raw_value or "").strip()
+        if not raw_text:
+            return None, None
+
+        parsed = urllib.parse.urlparse(raw_text)
+        path_text = parsed.path if parsed.scheme else raw_text
+        path_text = path_text.split("?", 1)[0].split("#", 1)[0].strip("/")
+        path_parts = [part for part in path_text.split("/") if part]
+
+        if "blogs" in path_parts:
+            blog_index = path_parts.index("blogs")
+            if len(path_parts) > blog_index + 2:
+                return path_parts[blog_index + 2], path_parts[blog_index + 1]
+
+        if len(path_parts) == 2:
+            return path_parts[1], path_parts[0]
+
+        bracket_match = re.search(r"\(([^()]+)\)\s*$", raw_text)
+        if bracket_match:
+            return bracket_match.group(1).strip(), None
+
+        if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", raw_text):
+            return raw_text, None
+
+        return None, None
+
+    def search_articles(search_query):
+        query = """
+        query ArticleLookup($query: String!) {
+          articles(first: 10, query: $query) {
+            nodes {
+              id
+              title
+              handle
+              blog {
+                id
+                handle
+                title
+              }
+            }
+          }
+        }
+        """
+        data = _graphql_post(query, {"query": search_query}, purpose=f"Article lookup '{search_query}'")
+        return ((((data or {}).get("data") or {}).get("articles") or {}).get("nodes") or [])
+
+    def resolve_article_reference_gid(raw_value):
+        if isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+
+        if not raw_value:
+            return None
+        if isinstance(raw_value, str) and raw_value.startswith("gid://shopify/Article/"):
+            return raw_value
+
+        normalized_value = normalize_metaobject_lookup_value(raw_value)
+        if normalized_value in article_lookup_cache:
+            return article_lookup_cache[normalized_value]
+
+        article_handle, blog_handle = extract_article_reference_candidate(raw_value)
+        if article_handle:
+            matches = search_articles(f"handle:{article_handle}")
+            exact_matches = [
+                article for article in matches
+                if normalize_metaobject_lookup_value(article.get("handle")) == normalize_metaobject_lookup_value(article_handle)
+                and (
+                    not blog_handle
+                    or normalize_metaobject_lookup_value(((article.get("blog") or {}).get("handle"))) == normalize_metaobject_lookup_value(blog_handle)
+                )
+            ]
+            if len(exact_matches) == 1:
+                article_lookup_cache[normalized_value] = exact_matches[0]["id"]
+                return exact_matches[0]["id"]
+
+            if len(exact_matches) > 1:
+                options = ", ".join(
+                    f"{((article.get('blog') or {}).get('handle') or 'unknown-blog')}/{article.get('handle')}"
+                    for article in exact_matches
+                )
+                print(
+                    f"❌ Article handle '{raw_value}' is ambiguous. Use blog-handle/article-handle. "
+                    f"Matches: {options}"
+                )
+                return None
+
+        matches = search_articles(str(raw_value).strip())
+        exact_matches = [
+            article for article in matches
+            if normalize_metaobject_lookup_value(article.get("title")) == normalized_value
+            or normalize_metaobject_lookup_value(article.get("handle")) == normalized_value
+        ]
+        if len(exact_matches) == 1:
+            article_lookup_cache[normalized_value] = exact_matches[0]["id"]
+            return exact_matches[0]["id"]
+
+        if len(exact_matches) > 1:
+            options = ", ".join(
+                f"{((article.get('blog') or {}).get('handle') or 'unknown-blog')}/{article.get('handle')}"
+                for article in exact_matches
+            )
+            print(
+                f"❌ Article value '{raw_value}' is ambiguous. Use blog-handle/article-handle. "
+                f"Matches: {options}"
+            )
+            return None
+
+        print(
+            f"❌ Could not resolve article reference value '{raw_value}'. "
+            "Use an article GID, article handle, full /blogs/blog-handle/article-handle URL, "
+            "or blog-handle/article-handle."
+        )
+        return None
+
+    def resolve_article_reference_list(value):
+        resolved_gids = []
+        seen = set()
+
+        for raw_item in parse_metaobject_reference_values(value):
+            resolved_gid = resolve_article_reference_gid(raw_item)
             if not resolved_gid:
                 return None
             if resolved_gid not in seen:
@@ -3132,6 +3348,38 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                     }
                 }
 
+            elif field_type == 'article_reference':
+                value_gid = resolve_article_reference_gid(value)
+                if not value_gid:
+                    continue
+
+                metafield_data = {
+                    "metafield": {
+                        "namespace": namespace,
+                        "key": key,
+                        "value": value_gid,
+                        "type": field_type.strip()
+                    }
+                }
+
+            elif field_type == 'list.article_reference':
+                value_gids = resolve_article_reference_list(value)
+                if not value_gids:
+                    print(
+                        f"❌ Skipping metafield update for {namespace}.{key} because no "
+                        "article references could be resolved."
+                    )
+                    continue
+
+                metafield_data = {
+                    "metafield": {
+                        "namespace": namespace,
+                        "key": key,
+                        "value": json.dumps(value_gids),
+                        "type": field_type.strip()
+                    }
+                }
+
             elif field_type == 'url':
                 if isinstance(value, str) and value.strip():
                     raw_value = value.strip()
@@ -3359,6 +3607,38 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                     print(
                         f"❌ Skipping variant metafield update for {namespace}.{key} "
                         "because no metaobject references could be resolved."
+                    )
+                    continue
+
+                metafield_data = {
+                    "metafield": {
+                        "namespace": namespace,
+                        "key": key,
+                        "value": json.dumps(value_gids),
+                        "type": field_type.strip()
+                    }
+                }
+
+            elif field_type == 'article_reference':
+                value_gid = resolve_article_reference_gid(value)
+                if not value_gid:
+                    continue
+
+                metafield_data = {
+                    "metafield": {
+                        "namespace": namespace,
+                        "key": key,
+                        "value": value_gid,
+                        "type": field_type.strip()
+                    }
+                }
+
+            elif field_type == 'list.article_reference':
+                value_gids = resolve_article_reference_list(value)
+                if not value_gids:
+                    print(
+                        f"❌ Skipping variant metafield update for {namespace}.{key} "
+                        "because no article references could be resolved."
                     )
                     continue
 
