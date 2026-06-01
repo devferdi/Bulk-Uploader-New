@@ -190,7 +190,6 @@ def html_to_shopify_json(html_input):
                     paragraph["children"].append({"type": "text", "value": child})
                 elif child.name == 'strong':  # Bold text
                     paragraph["children"].append({"type": "text", "value": child.get_text(), "bold": True})
-            print(f"Parsed paragraph: {paragraph}")  # Debug print
             return paragraph
 
         # Handle unordered lists
@@ -202,12 +201,17 @@ def html_to_shopify_json(html_input):
                     "children": [{"type": "text", "value": li.get_text()}]
                 })
             list_element = {"type": "list", "listType": "unordered", "children": list_items}
-            print(f"Parsed unordered list: {list_element}")  # Debug print
             return list_element
 
     # Parse each top-level element
     for element in soup.children:
-        if isinstance(element, str):  # Ignore plain text nodes
+        if isinstance(element, str):
+            text_value = element.strip()
+            if text_value:
+                json_structure["children"].append({
+                    "type": "paragraph",
+                    "children": [{"type": "text", "value": text_value}]
+                })
             continue
         parsed_element = parse_element(element)
         if parsed_element:
@@ -220,7 +224,6 @@ def html_to_shopify_json(html_input):
             "children": [{"type": "text", "value": ""}]  # Default empty content
         })
     
-    print(f"Final JSON structure: {json_structure}")  # Debug print to show final output
     return json_structure
 
 
@@ -6794,9 +6797,15 @@ def metaobject_run_uploader_logic(file_path=None, shopify_context=None, script_d
         if field_type == "rich_text_field":
             if isinstance(raw_value, str):
                 stripped_value = raw_value.strip()
+                if stripped_value.startswith("{"):
+                    try:
+                        json.loads(stripped_value)
+                        return stripped_value
+                    except json.JSONDecodeError:
+                        pass
                 if "<" in stripped_value and ">" in stripped_value:
                     return json.dumps(html_to_shopify_json(stripped_value), ensure_ascii=False)
-                return stripped_value
+                return json.dumps(html_to_shopify_json(stripped_value), ensure_ascii=False)
             return json.dumps(raw_value, ensure_ascii=False)
 
         if field_type.startswith("list."):
@@ -7609,6 +7618,7 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
     product_lookup_cache = {}
     metaobject_definition_type_cache = {}
     metaobject_lookup_cache = {}
+    blog_lookup_cache = None
 
     def _graphql_post(query, variables=None, purpose="(unspecified)", fail_on_errors=True):
         payload = {"query": query, "variables": variables or {}}
@@ -7696,6 +7706,100 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
         if value is None:
             return ""
         return re.sub(r"\s+", " ", str(value)).strip().casefold()
+
+    def add_blog_lookup_candidate(lookup, raw_value, entry):
+        normalized_value = normalize_reference_lookup_value(raw_value)
+        if not normalized_value:
+            return
+
+        matches = lookup.setdefault(normalized_value, [])
+        if all(existing["id"] != entry["id"] for existing in matches):
+            matches.append(entry)
+
+    def get_blog_lookup():
+        nonlocal blog_lookup_cache
+        if blog_lookup_cache is not None:
+            return blog_lookup_cache
+
+        query = """
+        query BlogList($after: String) {
+          blogs(first: 250, after: $after) {
+            nodes {
+              id
+              title
+              handle
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        """
+
+        lookup = {}
+        cursor = None
+        has_next_page = True
+        while has_next_page:
+            data = _graphql_post(query, {"after": cursor}, purpose="Blog lookup")
+            connection = (((data or {}).get("data") or {}).get("blogs") or {})
+            for blog in connection.get("nodes") or []:
+                blog_id = blog.get("id")
+                if not blog_id:
+                    continue
+                entry = {
+                    "id": blog_id,
+                    "title": blog.get("title") or "",
+                    "handle": blog.get("handle") or "",
+                }
+                add_blog_lookup_candidate(lookup, entry["id"], entry)
+                add_blog_lookup_candidate(lookup, entry["title"], entry)
+                add_blog_lookup_candidate(lookup, entry["handle"], entry)
+
+            page_info = connection.get("pageInfo") or {}
+            has_next_page = bool(page_info.get("hasNextPage"))
+            cursor = page_info.get("endCursor")
+            if has_next_page and not cursor:
+                has_next_page = False
+
+        blog_lookup_cache = lookup
+        return blog_lookup_cache
+
+    def resolve_blog_id(row_data, row_index, df):
+        blog_id = get_cell_string(row_data, "Blog ID")
+        candidates = [
+            ("Blog Handle", get_cell_string(row_data, "Blog Handle")),
+            ("Blog Title", get_cell_string(row_data, "Blog Title")),
+            ("Blog ID", blog_id),
+        ]
+        lookup = get_blog_lookup()
+
+        for column_name, raw_value in candidates:
+            if not raw_value:
+                continue
+            matches = lookup.get(normalize_reference_lookup_value(raw_value), [])
+            if len(matches) == 1:
+                blog = matches[0]
+                set_dataframe_cell(df, row_index, "Blog ID", blog["id"])
+                set_dataframe_cell(df, row_index, "Blog Title", blog["title"])
+                set_dataframe_cell(df, row_index, "Blog Handle", blog["handle"])
+                if column_name == "Blog ID" and blog_id and blog_id != blog["id"]:
+                    print(f"Replaced invalid Blog ID '{blog_id}' with '{blog['id']}' for row {row_index + 2}.")
+                return blog["id"]
+            if len(matches) > 1:
+                options = ", ".join(match.get("handle") or match.get("title") or match.get("id") for match in matches)
+                print(f"Blog value '{raw_value}' is ambiguous for row {row_index + 2}. Matches: {options}")
+                return None
+
+        if blog_id:
+            print(
+                f"Could not verify Blog ID '{blog_id}' for row {row_index + 2}. "
+                "Use a valid Blog Handle or Blog Title from the store."
+            )
+            return blog_id
+
+        print(f"Could not resolve a blog for row {row_index + 2}. Add Blog Handle, Blog Title, or Blog ID.")
+        return None
 
     def parse_reference_values(value):
         if value is None:
@@ -8303,6 +8407,49 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
         set_dataframe_cell(df, row_index, column_name, url or gid)
         return gid
 
+    def resolve_article_image_source(raw_value, existing_files, row_index, df, column_name):
+        image_reference = get_cell_string({column_name: raw_value}, column_name)
+        if not image_reference:
+            return None
+
+        if is_valid_gid(image_reference):
+            resolved_url = get_image_url_for_gid(image_reference)
+            if resolved_url:
+                set_dataframe_cell(df, row_index, column_name, resolved_url)
+                return resolved_url
+            print(f"Could not resolve article image URL from GID '{image_reference}' for row {row_index + 2}.")
+            return None
+
+        if image_reference.startswith(("http://", "https://")):
+            return image_reference
+
+        existing_entry = fetch_file_reference(existing_files, image_reference)
+        if existing_entry:
+            _, existing_url = existing_entry
+            if existing_url:
+                set_dataframe_cell(df, row_index, column_name, existing_url)
+                return existing_url
+
+        file_path_local = resolve_local_asset_path(image_reference)
+        if not file_path_local:
+            print(
+                f"Image file '{image_reference}' was not found for row {row_index + 2}; "
+                "creating the article without an image."
+            )
+            return None
+
+        uploaded_url, uploaded_gid = upload_file_to_shopify(file_path_local)
+        if not uploaded_url:
+            print(
+                f"Failed to upload image file '{image_reference}' for row {row_index + 2}; "
+                "creating the article without an image."
+            )
+            return None
+
+        remember_file_reference(existing_files, image_reference, uploaded_gid, uploaded_url)
+        set_dataframe_cell(df, row_index, column_name, uploaded_url)
+        return uploaded_url
+
     def resolve_metafield_value(field_definition, raw_value, existing_files, row_index, df, column_name):
         field_type = (field_definition.get("type") or "").strip()
         field_key = field_definition.get("key")
@@ -8355,9 +8502,15 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
         if field_type == "rich_text_field":
             if isinstance(raw_value, str):
                 stripped_value = raw_value.strip()
+                if stripped_value.startswith("{"):
+                    try:
+                        json.loads(stripped_value)
+                        return stripped_value
+                    except json.JSONDecodeError:
+                        pass
                 if "<" in stripped_value and ">" in stripped_value:
                     return json.dumps(html_to_shopify_json(stripped_value), ensure_ascii=False)
-                return stripped_value
+                return json.dumps(html_to_shopify_json(stripped_value), ensure_ascii=False)
             return json.dumps(raw_value, ensure_ascii=False)
 
         if field_type.startswith("list."):
@@ -8378,13 +8531,13 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
             "type": match.group(3).strip(),
         }
 
-    def build_article_input(row_data, is_create):
+    def build_article_input(row_data, is_create, row_index, df, existing_files):
         article_input = {}
 
         if is_create:
-            blog_id = get_cell_string(row_data, "Blog ID")
+            blog_id = resolve_blog_id(row_data, row_index, df)
             if not blog_id:
-                return None, "Blog ID is required when creating a new article row."
+                return None, "Blog ID, Blog Handle, or Blog Title is required when creating a new article row."
             article_input["blogId"] = blog_id
 
         if "Title" in row_data:
@@ -8426,9 +8579,15 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
         author_name = get_cell_string(row_data, "Author") if "Author" in row_data else ""
         if author_name:
             article_input["author"] = {"name": author_name}
+        elif is_create:
+            return None, "Author is required when creating a new article row."
 
         image_input = {}
-        image_url = get_cell_string(row_data, "Image URL") if "Image URL" in row_data else ""
+        image_url = (
+            resolve_article_image_source(row_data.get("Image URL"), existing_files, row_index, df, "Image URL")
+            if "Image URL" in row_data
+            else ""
+        )
         image_alt = get_cell_string(row_data, "Image Alt Text") if "Image Alt Text" in row_data else ""
         if image_url:
             image_input["url"] = image_url
@@ -8563,6 +8722,9 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
     requires_file_lookup = any(
         field_definition.get("type") in {"file_reference", "list.file_reference"}
         for _, field_definition in metafield_columns
+    ) or (
+        "Image URL" in df.columns
+        and df["Image URL"].apply(has_cell_value).any()
     )
     if requires_file_lookup:
         print("Fetching existing Shopify files for file-reference fields...")
@@ -8583,7 +8745,7 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
         article_id = get_cell_string(row_data, "ID")
         is_create = not bool(article_id)
 
-        article_input, article_error = build_article_input(row_data, is_create)
+        article_input, article_error = build_article_input(row_data, is_create, index, df, existing_files)
         if article_error:
             message = f"Skipping row {index + 2}: {article_error}"
             failed_rows.append(message)
