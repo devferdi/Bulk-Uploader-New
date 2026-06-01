@@ -7610,21 +7610,30 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
     metaobject_definition_type_cache = {}
     metaobject_lookup_cache = {}
 
-    def _graphql_post(query, variables=None, purpose="(unspecified)"):
+    def _graphql_post(query, variables=None, purpose="(unspecified)", fail_on_errors=True):
         payload = {"query": query, "variables": variables or {}}
         try:
             response = requests.post(GRAPHQL_URL, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as exc:
-            print(f"GraphQL {purpose} request failed: {exc}")
+            message = f"GraphQL {purpose} request failed: {exc}"
+            if fail_on_errors:
+                raise RuntimeError(message) from exc
+            print(message)
             return None
         except ValueError as exc:
-            print(f"GraphQL {purpose} returned invalid JSON: {exc}")
+            message = f"GraphQL {purpose} returned invalid JSON: {exc}"
+            if fail_on_errors:
+                raise RuntimeError(message) from exc
+            print(message)
             return None
 
         if data.get("errors"):
-            print(f"GraphQL {purpose} errors: {data['errors']}")
+            message = f"GraphQL {purpose} errors: {data['errors']}"
+            if fail_on_errors:
+                raise RuntimeError(message)
+            print(message)
         return data
 
     def resolve_local_asset_path(filename):
@@ -7641,6 +7650,9 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
         if isinstance(value, str):
             return bool(value.strip())
         return True
+
+    def row_has_upload_values(row_data):
+        return any(has_cell_value(value) for value in row_data.values())
 
     def get_cell_string(row_data, column_name):
         value = row_data.get(column_name)
@@ -8010,7 +8022,12 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
         cursor = None
         has_next_page = True
         while has_next_page:
-            data = _graphql_post(query, {"after": cursor}, purpose="Shopify files lookup")
+            data = _graphql_post(
+                query,
+                {"after": cursor},
+                purpose="Shopify files lookup",
+                fail_on_errors=False,
+            )
             connection = (((data or {}).get("data") or {}).get("files") or {})
             for edge in connection.get("edges") or []:
                 node = edge.get("node") or {}
@@ -8377,17 +8394,24 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
             elif is_create:
                 return None, "Title is required when creating a new article row."
 
+        if "Handle" in row_data:
+            handle = get_cell_string(row_data, "Handle")
+            if handle:
+                article_input["handle"] = handle
+
         for column_name, input_key in [
-            ("Handle", "handle"),
             ("Body HTML", "body"),
             ("Summary HTML", "summary"),
             ("Template Suffix", "templateSuffix"),
         ]:
             if column_name in row_data:
-                article_input[input_key] = get_cell_string(row_data, column_name)
+                value = get_cell_string(row_data, column_name)
+                if value or not is_create:
+                    article_input[input_key] = value
 
         if "Tags" in row_data:
-            article_input["tags"] = parse_tags_value(row_data.get("Tags"))
+            if has_cell_value(row_data.get("Tags")) or not is_create:
+                article_input["tags"] = parse_tags_value(row_data.get("Tags"))
 
         if "Published" in row_data and has_cell_value(row_data.get("Published")):
             parsed_published = parse_bool_value(row_data.get("Published"))
@@ -8413,7 +8437,7 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
         if image_input:
             article_input["image"] = image_input
 
-        if "handle" in article_input:
+        if "handle" in article_input and not is_create:
             article_input["redirectNewHandle"] = True
 
         return article_input, None
@@ -8536,18 +8560,34 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
         }
         metafield_columns.append((column_name, field_definition))
 
-    print("Fetching existing Shopify files for file-reference fields...")
-    existing_files = get_all_files() or {}
-    print(f"Retrieved {len(existing_files)} existing Shopify file references.")
+    requires_file_lookup = any(
+        field_definition.get("type") in {"file_reference", "list.file_reference"}
+        for _, field_definition in metafield_columns
+    )
+    if requires_file_lookup:
+        print("Fetching existing Shopify files for file-reference fields...")
+        existing_files = get_all_files() or {}
+        print(f"Retrieved {len(existing_files)} existing Shopify file references.")
+    else:
+        existing_files = {}
 
+    processed_rows = 0
+    successful_rows = 0
+    failed_rows = []
     for index, row in df.iterrows():
         row_data = row.to_dict()
+        if not row_has_upload_values(row_data):
+            continue
+
+        processed_rows += 1
         article_id = get_cell_string(row_data, "ID")
         is_create = not bool(article_id)
 
         article_input, article_error = build_article_input(row_data, is_create)
         if article_error:
-            print(f"Skipping row {index + 2}: {article_error}")
+            message = f"Skipping row {index + 2}: {article_error}"
+            failed_rows.append(message)
+            print(message)
             continue
 
         article = None
@@ -8558,7 +8598,15 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
             article, user_errors = update_article(article_id, article_input)
 
         if user_errors:
-            print(f"Shopify returned article user errors for row {index + 2}: {user_errors}")
+            message = f"Shopify returned article user errors for row {index + 2}: {user_errors}"
+            failed_rows.append(message)
+            print(message)
+            continue
+
+        if is_create and not article:
+            message = f"Shopify did not return a created article for row {index + 2}."
+            failed_rows.append(message)
+            print(message)
             continue
 
         if article:
@@ -8574,7 +8622,9 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
                 set_dataframe_cell(df, index, "Blog Handle", blog.get("handle"))
 
         if not article_id:
-            print(f"Skipping metafields for row {index + 2} because no article ID is available.")
+            message = f"Skipping metafields for row {index + 2} because no article ID is available."
+            failed_rows.append(message)
+            print(message)
             continue
 
         metafield_inputs = []
@@ -8615,8 +8665,19 @@ def blog_entries_run_uploader_logic(file_path=None, shopify_context=None, script
                 print(f"Updated {len(metafield_inputs)} metafields for row {index + 2}.")
 
         print(f"Blog entry processed for row {index + 2}: {article_id}")
+        successful_rows += 1
 
     df.to_excel(file_path, index=False)
+    if processed_rows == 0:
+        raise RuntimeError("No blog entry rows with values were found in the spreadsheet.")
+    if successful_rows == 0 and failed_rows:
+        error_summary = "; ".join(failed_rows[:3])
+        if len(failed_rows) > 3:
+            error_summary += f"; and {len(failed_rows) - 3} more row errors"
+        raise RuntimeError(f"No blog entries were uploaded. {error_summary}")
+
+    if failed_rows:
+        print(f"Blog entries upload completed with {len(failed_rows)} skipped row(s).")
     print("Blog entries upload completed and the spreadsheet was updated with the latest IDs and handles.")
     return file_path
 
