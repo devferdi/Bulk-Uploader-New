@@ -58,17 +58,47 @@ def encode_filename(filename):
     return urllib.parse.quote(filename)
 
 
+def normalize_file_lookup_name(name):
+    decoded_name = urllib.parse.unquote(str(name or "")).strip()
+    normalized_name = unicodedata.normalize('NFKD', decoded_name)
+    without_accents = "".join(
+        character
+        for character in normalized_name
+        if not unicodedata.combining(character)
+    )
+    return re.sub(r"[^a-z0-9]+", "", without_accents.casefold())
+
+
 def build_file_lookup_keys(name):
     if not name:
         return set()
-    base_name = os.path.basename(name)
-    normalized_name = normalize_filename(base_name)
-    keys = {
-        base_name,
-        normalized_name,
-        base_name.lower(),
-        normalized_name.lower(),
+
+    raw_name = str(name).strip()
+    parsed = urllib.parse.urlparse(raw_name)
+    path_name = parsed.path if parsed.path else raw_name.split("?", 1)[0]
+    base_names = {
+        os.path.basename(raw_name),
+        os.path.basename(path_name),
+        urllib.parse.unquote(os.path.basename(raw_name)),
+        urllib.parse.unquote(os.path.basename(path_name)),
     }
+
+    keys = set()
+    for base_name in base_names:
+        if not base_name:
+            continue
+        normalized_name = normalize_filename(base_name)
+        keys.update(
+            {
+                base_name,
+                normalized_name,
+                base_name.casefold(),
+                normalized_name.casefold(),
+                normalize_file_lookup_name(base_name),
+                normalize_file_lookup_name(normalized_name),
+            }
+        )
+
     return {key for key in keys if key}
 
 
@@ -95,10 +125,10 @@ def fetch_file_reference(files_dict, filename):
 def extract_filename_from_value(value):
     if not value:
         return ""
-    parsed = urllib.parse.urlparse(str(value))
-    if parsed.scheme and parsed.path:
-        return os.path.basename(parsed.path)
-    return os.path.basename(str(value))
+    raw_value = str(value).strip()
+    parsed = urllib.parse.urlparse(raw_value)
+    path_value = parsed.path if parsed.path else raw_value.split("?", 1)[0]
+    return urllib.parse.unquote(os.path.basename(path_value))
 
 
 def guess_mime_type(filename):
