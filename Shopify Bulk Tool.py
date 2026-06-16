@@ -32,6 +32,7 @@ from openai import OpenAI
 
 file_lock = threading.Lock()  # 🔒 Prevents simultaneous write conflicts
 DEFAULT_SHOPIFY_API_VERSION = "2026-01"
+IMAGE_EXTENSION_FALLBACKS = ('.png', '.jpg', '.jpeg')
 
 
 def ensure_tkinter_available():
@@ -102,6 +103,25 @@ def build_file_lookup_keys(name):
     return {key for key in keys if key}
 
 
+def build_image_extension_fallback_names(filename):
+    if not filename:
+        return []
+
+    raw_filename = str(filename).strip()
+    if not raw_filename:
+        return []
+
+    _, extension = os.path.splitext(raw_filename)
+    if extension:
+        return []
+
+    fallback_names = []
+    for fallback_extension in IMAGE_EXTENSION_FALLBACKS:
+        fallback_names.append(f"{raw_filename}{fallback_extension}")
+        fallback_names.append(f"{raw_filename}{fallback_extension.upper()}")
+    return fallback_names
+
+
 def is_valid_gid(gid):
     return isinstance(gid, str) and gid.startswith('gid://')
 
@@ -116,9 +136,11 @@ def remember_file_reference(files_dict, filename, gid, url):
 def fetch_file_reference(files_dict, filename):
     if not filename:
         return None
-    for key in build_file_lookup_keys(filename):
-        if key in files_dict:
-            return files_dict[key]
+    lookup_names = [filename] + build_image_extension_fallback_names(filename)
+    for lookup_name in lookup_names:
+        for key in build_file_lookup_keys(lookup_name):
+            if key in files_dict:
+                return files_dict[key]
     return None
 
 
@@ -155,16 +177,23 @@ def resolve_asset_from_directories(filename, directories):
     if not filename:
         return None
 
-    if os.path.isabs(filename) and os.path.exists(filename):
-        return filename
-
     normalized_filename = normalize_filename(filename)
+    filename_candidates = []
+    for candidate in [filename, normalized_filename]:
+        if candidate and candidate not in filename_candidates:
+            filename_candidates.append(candidate)
+        for fallback_name in build_image_extension_fallback_names(candidate):
+            if fallback_name and fallback_name not in filename_candidates:
+                filename_candidates.append(fallback_name)
+
+    if os.path.isabs(filename):
+        for candidate in filename_candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return None
 
     for directory in directories:
-        potential_paths = [
-            os.path.join(directory, filename),
-            os.path.join(directory, normalized_filename),
-        ]
+        potential_paths = [os.path.join(directory, candidate) for candidate in filename_candidates]
         for path in potential_paths:
             if os.path.exists(path):
                 return path
