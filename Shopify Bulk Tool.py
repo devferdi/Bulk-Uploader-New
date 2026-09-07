@@ -33,6 +33,7 @@ from openai import OpenAI
 file_lock = threading.Lock()  # 🔒 Prevents simultaneous write conflicts
 DEFAULT_SHOPIFY_API_VERSION = "2026-01"
 IMAGE_EXTENSION_FALLBACKS = ('.png', '.jpg', '.jpeg')
+TEMPORARY_VARIANT_OPTION_VALUE = "__HUX_TEMPORARY_VARIANT__"
 
 
 def ensure_tkinter_available():
@@ -274,6 +275,59 @@ def is_default_shopify_variant(variant):
             and normalize_variant_option(variant.get("option3")) is None
         )
     )
+
+
+def is_temporary_shopify_variant(variant):
+    """Return whether a variant is the temporary singleton-preservation variant."""
+    return any(
+        normalize_variant_option(variant.get(f"option{option_index}"))
+        == TEMPORARY_VARIANT_OPTION_VALUE
+        for option_index in range(1, 4)
+    )
+
+
+def build_temporary_variant(real_variant):
+    """Create a harmless second combination so Shopify retains custom options."""
+    temporary_variant = {"option1": TEMPORARY_VARIANT_OPTION_VALUE}
+
+    for option_index in range(2, 4):
+        option_key = f"option{option_index}"
+        option_value = normalize_variant_option(real_variant.get(option_key))
+        if option_value is not None:
+            temporary_variant[option_key] = option_value
+
+    price = real_variant.get("price")
+    if price is not None:
+        temporary_variant["price"] = price
+
+    return temporary_variant
+
+
+def assign_existing_variant_ids(requested_variants, existing_variants):
+    """Make repeated singleton uploads reuse both real and temporary variants."""
+    for candidate in requested_variants:
+        matching_existing_variant = next(
+            (
+                existing_variant
+                for existing_variant in existing_variants
+                if variant_matches_options(existing_variant, candidate)
+            ),
+            None,
+        )
+        if matching_existing_variant and matching_existing_variant.get("id"):
+            candidate["id"] = matching_existing_variant["id"]
+
+    if len(existing_variants) == 1 and is_default_shopify_variant(existing_variants[0]):
+        real_requested_variant = next(
+            (
+                candidate
+                for candidate in requested_variants
+                if not is_temporary_shopify_variant(candidate)
+            ),
+            None,
+        )
+        if real_requested_variant and not real_requested_variant.get("id"):
+            real_requested_variant["id"] = existing_variants[0].get("id")
 
 
 def prepare_variant_create_data(updated_data, product_id):
@@ -2510,6 +2564,15 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             return create_new_product(updated_data)
 
         url = f"{BASE_URL}/products/{product_id}.json"
+        requested_variants = updated_data.get("product", {}).get("variants", [])
+        if len(requested_variants) > 1:
+            current_product_response = requests.get(url, headers=headers)
+            if current_product_response.status_code == 200:
+                current_product = current_product_response.json().get("product", {})
+                assign_existing_variant_ids(
+                    requested_variants,
+                    current_product.get("variants", []),
+                )
         updated_data["product"] = clean_data(updated_data["product"])
         response = requests.put(url, headers=headers, json=updated_data)
 
@@ -2521,14 +2584,19 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             variant_id = None
             product_payload = response.json().get("product", {}) if response.content else {}
             variants = product_payload.get("variants", []) if isinstance(product_payload, dict) else []
-            if variants:
-                variant_id = variants[0].get("id")
+            requested_variant = requested_variants[0] if requested_variants else {}
+            matching_variant = next(
+                (
+                    candidate
+                    for candidate in variants
+                    if variant_matches_options(candidate, requested_variant)
+                ),
+                None,
+            )
+            if matching_variant:
+                variant_id = matching_variant.get("id")
             if not variant_id:
-                variant_id = (
-                    updated_data.get("product", {})
-                    .get("variants", [{}])[0]
-                    .get("id")
-                )
+                variant_id = requested_variant.get("id")
             return product_id, variant_id
         else:
             print(f"Failed to update product {product_id}: {response.status_code}, {response.text}")
@@ -2551,6 +2619,9 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
 
                 requested_variants = updated_data.get("product", {}).get("variants", [])
                 requested_variant = requested_variants[0] if requested_variants else {}
+                existing_variants = products[0].get("variants", [])
+                assign_existing_variant_ids(requested_variants, existing_variants)
+
                 variant_id = requested_variant.get("id")
 
                 url_update = f"{BASE_URL}/products/{products[0]['id']}.json"
@@ -2707,15 +2778,59 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
     def delete_variant(variant_id):
         if not variant_id:
             print("Variant ID not provided. Cannot delete variant.")
-            return
+            return False
         
         url = f"{BASE_URL}/variants/{variant_id}.json"
         response = requests.delete(url, headers=headers)
         
         if response.status_code in [200, 204]:
             print(f"Successfully deleted variant with ID {variant_id}.")
+            return True
         else:
             print(f"Failed to delete variant with ID {variant_id}: {response.status_code}, {response.text}")
+            return False
+
+
+    def delete_temporary_variants(product_id, real_variant_id):
+        """Delete ghost variants only after confirming that the real variant exists."""
+        if not product_id or not real_variant_id:
+            print("Keeping temporary variant because the real product variant is missing.")
+            return False
+
+        variants_url = f"{BASE_URL}/products/{product_id}/variants.json"
+        response = requests.get(variants_url, headers=headers)
+        if response.status_code != 200:
+            print(
+                f"Keeping temporary variant because variants for product {product_id} "
+                f"could not be verified: {response.status_code}, {response.text}"
+            )
+            return False
+
+        variants = response.json().get("variants", [])
+        real_variant_exists = any(
+            str(variant.get("id")) == str(real_variant_id)
+            and not is_temporary_shopify_variant(variant)
+            for variant in variants
+        )
+        if not real_variant_exists:
+            print(
+                f"Keeping temporary variant because real variant {real_variant_id} "
+                f"was not found on product {product_id}."
+            )
+            return False
+
+        temporary_variants = [
+            variant for variant in variants if is_temporary_shopify_variant(variant)
+        ]
+        if not temporary_variants:
+            return True
+
+        all_deleted = True
+        for temporary_variant in temporary_variants:
+            temporary_variant_id = temporary_variant.get("id")
+            print(f"Deleting temporary variant {temporary_variant_id} from product {product_id}.")
+            all_deleted = delete_variant(temporary_variant_id) and all_deleted
+        return all_deleted
 
 
     def create_new_product(data):
@@ -2730,7 +2845,17 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             product = response.json().get("product", {})
             product_id = product.get("id")
             variants = product.get("variants", [])  # Get the variants from the response
-            variant_id = variants[0].get("id") if variants else None  # Extract the first variant ID if available
+            requested_variants = data.get("product", {}).get("variants", [])
+            requested_variant = requested_variants[0] if requested_variants else {}
+            matching_variant = next(
+                (
+                    candidate
+                    for candidate in variants
+                    if variant_matches_options(candidate, requested_variant)
+                ),
+                None,
+            )
+            variant_id = matching_variant.get("id") if matching_variant else None
             
             if product_id:
                 identifier = data['product'].get('handle', data['product'].get("variants", [{}])[0].get("sku"))
@@ -3289,11 +3414,13 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             print(
                 f"✅ Successfully {action} metafield {namespace}.{key} for {owner_type} {owner_id}"
             )
+            return True
         else:
             print(
                 f"❌ Failed to {action} metafield {namespace}.{key} for {owner_type} {owner_id}: {response.status_code}"
             )
             print(f"⚠️ Response Body: {response.text}")
+            return False
 
     def update_metafields(handle, metafields, existing_files, row_index, df):
         product_id = handle
@@ -3577,12 +3704,15 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
     def update_variant_metafields(variant_id, metafields, existing_files, row_index, df):
         if not variant_id:
             print("Skipping metafield update for missing variant ID.")
-            return
+            return False
 
         current_metafields_url = f"{BASE_URL}/variants/{variant_id}/metafields.json"
         response = requests.get(current_metafields_url, headers=headers)
+        all_updates_succeeded = response.status_code == 200
         current_metafields = response.json().get('metafields', []) if response.status_code == 200 else []
         current_metafields_dict = {f"{mf['namespace']}.{mf['key']}": mf['id'] for mf in current_metafields}
+        expected_metafield_updates = set()
+        successful_metafield_updates = set()
 
         for column, value in metafields.items():
             key_type_str = column.replace('Variant Metafield: ', '').split(' ')
@@ -3598,6 +3728,8 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                     current_metafields_dict.pop(metafield_key, None)
                 continue
 
+            metafield_key = f"{namespace}.{key}"
+            expected_metafield_updates.add(metafield_key)
             metafield_data = None
 
             if field_type == 'file_reference':
@@ -3840,9 +3972,17 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 }
 
             if metafield_data:
-                upsert_metafield(
+                metafield_updated = upsert_metafield(
                     "variant", variant_id, namespace, key, metafield_data, current_metafields_dict
                 )
+                all_updates_succeeded = metafield_updated and all_updates_succeeded
+                if metafield_updated:
+                    successful_metafield_updates.add(metafield_key)
+
+        return (
+            all_updates_succeeded
+            and expected_metafield_updates.issubset(successful_metafield_updates)
+        )
 
     def upload_market_prices(price_list_id, market_prices):
         """
@@ -3918,7 +4058,30 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 return ("{0:f}".format(numeric_value)).rstrip("0").rstrip(".")
             return str(value).strip()
 
-       
+        def normalize_handle_value(value):
+            if not has_cell_value(value):
+                return None
+            handle_value = str(value).split(".")[0].lower().replace(" ", "-").replace("/", "-")
+            handle_value = re.sub(r"[^a-z0-9-]", "", handle_value)
+            return handle_value or None
+
+        variant_combinations_by_handle = {}
+        counted_handle = None
+        for _, candidate_row in df.iterrows():
+            candidate_handle = normalize_handle_value(candidate_row.get("Handle"))
+            if candidate_handle:
+                counted_handle = candidate_handle
+            if counted_handle:
+                option_signature = tuple(
+                    normalize_option_value(candidate_row.get(f"Option{option_index} Value"))
+                    for option_index in range(1, 4)
+                )
+                if any(option_signature):
+                    variant_combinations_by_handle.setdefault(counted_handle, set()).add(
+                        option_signature
+                    )
+
+
 
         # Get existing files mapping
         print("Fetching all existing files from Shopify...")
@@ -4596,8 +4759,7 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
 
             if pd.notna(handle):
                 original_handle_value = str(handle)
-                handle_candidate = original_handle_value.split(".")[0].lower().replace(" ", "-").replace("/", "-")
-                handle_candidate = re.sub(r"[^a-z0-9-]", "", handle_candidate)
+                handle_candidate = normalize_handle_value(handle)
 
                 if handle_candidate:
                     handle = handle_candidate
@@ -4651,7 +4813,19 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                             "values": option_values
                         })
 
-         
+            first_option_values = product_options[0].get("values", []) if product_options else []
+            has_custom_option = any(
+                normalize_variant_option(option_value) not in (None, "Default Title")
+                for option_value in first_option_values
+            )
+            use_temporary_variant = (
+                bool(handle)
+                and len(variant_combinations_by_handle.get(handle, set())) == 1
+                and bool(product_options)
+                and has_custom_option
+            )
+
+
             variant_name_parts = []
             for i in range(1, 4):
                 normalized_variant_option = normalize_option_value(row.get(f'Option{i} Value'))
@@ -4696,10 +4870,19 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 if has_cell_value(row.get('Variant Weight Unit')):
                     variant_payload["weight_unit"] = row.get('Variant Weight Unit')
 
+                product_variants = [variant_payload]
+                if use_temporary_variant:
+                    if TEMPORARY_VARIANT_OPTION_VALUE not in product_options[0]["values"]:
+                        product_options[0]["values"].append(TEMPORARY_VARIANT_OPTION_VALUE)
+                    product_variants.append(build_temporary_variant(variant_payload))
+                    print(
+                        f"Adding a temporary second variant for single-variant product '{handle}'."
+                    )
+
                 product_payload = {
                     "title": row['Title'],
                     "options": product_options or [{"name": "Title", "values": ["Default Title"]}],
-                    "variants": [variant_payload]
+                    "variants": product_variants
                 }
                 if product_id:
                     product_payload["id"] = product_id
@@ -4977,11 +5160,31 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                     else:
                         print(f"[INFO] Market '{market_name}' from column '{column}' not found in Shopify markets. Skipping.")
 
+                variant_metafields_succeeded = True
                 if variant_metafields:
-                    update_variant_metafields(variant_id, variant_metafields, existing_files, index, df)
+                    variant_metafields_succeeded = update_variant_metafields(
+                        variant_id,
+                        variant_metafields,
+                        existing_files,
+                        index,
+                        df,
+                    )
 
-                else:
-                    print(f"Failed to process variant for handle '{handle}'.")
+                if use_temporary_variant:
+                    cleanup_product_id = product_id or get_product_id_by_handle(handle)
+                    if variant_metafields_succeeded:
+                        if delete_temporary_variants(cleanup_product_id, variant_id):
+                            print(
+                                f"Temporary variant cleanup completed for product '{handle}'."
+                            )
+                    else:
+                        print(
+                            f"Keeping the temporary variant for product '{handle}' because "
+                            "one or more real-variant metafields failed to save."
+                        )
+
+            else:
+                print(f"Failed to process variant for handle '{handle}'.")
 
 
 
