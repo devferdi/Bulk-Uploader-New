@@ -250,6 +250,27 @@ def normalize_variant_option(value):
     return str(value)
 
 
+def normalize_sku_value(value):
+    """Return the same stable SKU string for Excel numbers and Shopify strings."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        value = value.strip()
+        return value if value else None
+    if isinstance(value, numbers.Number):
+        numeric_value = float(value)
+        if numeric_value.is_integer():
+            return str(int(numeric_value))
+        return ("{0:f}".format(numeric_value)).rstrip("0").rstrip(".")
+    value = str(value).strip()
+    return value if value else None
+
+
 def variant_matches_options(variant, requested_variant):
     """Match a Shopify variant against the option values supplied by one row."""
     for option_index in range(1, 4):
@@ -2717,7 +2738,8 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
 
 
     def update_product_by_sku(sku, updated_data):
-        if not sku:
+        normalized_sku = normalize_sku_value(sku)
+        if not normalized_sku:
             print("SKU not provided. Cannot update or create product.")
             return None, None
         
@@ -2726,20 +2748,28 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
 
         # Fetch all products
         products = get_all_products_forsku()
+        found_product = None
         found_variant = None
 
         # Check if any existing variant matches the SKU
         for product in products:
             for variant in product['variants']:
-                if variant['sku'] == sku:
+                if normalize_sku_value(variant.get('sku')) == normalized_sku:
+                    found_product = product
                     found_variant = variant
                     break
             if found_variant:
                 break
 
         if found_variant:
-            product_id = found_variant['product_id']  # Assuming this key exists in your data structure
+            product_id = found_product['id']
             variant_id = found_variant['id']
+
+            requested_variants = updated_data.get("product", {}).get("variants", [])
+            assign_existing_variant_ids(
+                requested_variants,
+                found_product.get("variants", []),
+            )
 
             # Update the product with the product ID
             url_update = f"{BASE_URL}/products/{product_id}.json"
@@ -2751,17 +2781,13 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 return product_id, variant_id
             else:
                 print(f"Failed to update product with SKU '{sku}': {response_update.status_code}, {response_update.text}")
+                return None, None
 
         print(f"No product found with SKU '{sku}'. Attempting to create new product.")
 
-        # If no product with the given SKU exists, create a new one
-        variant_details = updated_data["product"]["variants"][0] if "variants" in updated_data["product"] and len(updated_data["product"]["variants"]) > 0 else {}
-        updated_data["product"]["variants"] = [{
-            'sku': sku,
-            'price': variant_details.get("price"),
-            'weight': variant_details.get("weight"),
-            'weight_unit': variant_details.get("weight_unit", "kg")  # assuming default weight unit if not specified
-        }]  # Add SKU, price, and weight to the variants in the product data
+        # Keep the complete variant/options payload. Previously this SKU fallback
+        # replaced it with only price/weight fields, which silently discarded
+        # Option1 Name/Value for spreadsheets that do not contain a Handle.
         updated_data["product"] = clean_data(updated_data["product"])  # Clean the data
         print("Updated Data for Product Creation:", json.dumps(updated_data, indent=4))
         product_id, variant_id = create_new_product(updated_data)
@@ -2935,115 +2961,129 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
         return (created_variant_id is not None), created_variant_id, None, None
 
 
-    def update_or_create_variant_by_handle(handle, variant_data):
-        if not handle:
-            print("Handle not provided. Cannot update or create variant.")
+    def update_or_create_variant_for_product(product_id, variant_data, identifier=None):
+        """Update/create a variant after the product was resolved by ID, handle, or SKU."""
+        if not product_id:
+            print("Product ID not provided. Cannot update or create variant.")
             return None
 
-        # Fetch product by handle
+        variants_url = f"{BASE_URL}/products/{product_id}/variants.json"
+        variants_response = requests.get(variants_url, headers=headers)
+        if variants_response.status_code != 200:
+            print(
+                f"Failed to fetch variants for product ID {product_id}: "
+                f"{variants_response.status_code}, {variants_response.text}"
+            )
+            return None
+
+        variants = variants_response.json().get('variants', [])
+        requested_variant = variant_data["variant"]
+        existing_variant = next(
+            (v for v in variants if variant_matches_options(v, requested_variant)),
+            None,
+        )
+        if existing_variant:
+            variant_id = existing_variant['id']
+            print(f"Existing variant found with ID {variant_id}. Updating variant.")
+            (
+                success,
+                updated_variant_id,
+                response_status,
+                response_payload,
+            ) = update_or_create_variant(product_id, variant_id, variant_data)
+
+            if success and updated_variant_id:
+                if isinstance(response_payload, dict):
+                    variant_response = response_payload.get("variant", {}) or {}
+                    requested_image_id = variant_data["variant"].get("image_id")
+                    requested_media_id = variant_data["variant"].get("media_id")
+                    response_image_id = variant_response.get("image_id")
+
+                    if (
+                        (requested_image_id or requested_media_id)
+                        and not response_image_id
+                    ):
+                        print(
+                            f"Warning: Shopify did not return an image_id for variant {updated_variant_id} "
+                            f"after requesting image assignment (image_id={requested_image_id}, "
+                            f"media_id={requested_media_id})."
+                        )
+
+                return updated_variant_id
+
+            failure_details = []
+            if response_status:
+                failure_details.append(f"status {response_status}")
+
+            if isinstance(response_payload, dict):
+                if response_payload.get("errors"):
+                    failure_details.append(f"errors: {response_payload.get('errors')}")
+                elif response_payload.get("raw"):
+                    failure_details.append(f"response: {response_payload.get('raw')}")
+            elif response_payload:
+                failure_details.append(f"response: {response_payload}")
+
+            requested_image_id = variant_data["variant"].get("image_id")
+            requested_media_id = variant_data["variant"].get("media_id")
+            if requested_image_id or requested_media_id:
+                failure_details.append(
+                    "requested "
+                    f"image_id={requested_image_id} media_id={requested_media_id}"
+                )
+
+            detail_message = "; ".join(detail for detail in failure_details if detail)
+            product_label = identifier or product_id
+            print(
+                f"Variant update failed for product '{product_label}' (variant ID {variant_id}). "
+                + (detail_message if detail_message else "Check the response details above.")
+            )
+            return None
+
+        default_variant = next(
+            (v for v in variants if is_default_shopify_variant(v)),
+            None,
+        )
+        if len(variants) == 1 and default_variant:
+            default_variant_id = default_variant.get("id")
+            print(
+                "Replacing Shopify's default variant with the spreadsheet variant "
+                f"using ID {default_variant_id}."
+            )
+            success, new_variant_id, _, _ = update_or_create_variant(
+                product_id,
+                default_variant_id,
+                variant_data,
+            )
+            return new_variant_id if success else None
+
+        print("No matching variant found. Creating a new variant.")
+        new_variant_id = create_new_variant(product_id, variant_data)
+        if new_variant_id:
+            print(f"New variant created with ID {new_variant_id}.")
+        return new_variant_id
+
+
+    def update_or_create_variant_by_handle(handle, variant_data):
+        if not handle:
+            print("Handle not provided. Cannot resolve product for variant.")
+            return None
+
         url = f"{BASE_URL}/products.json?handle={handle}"
         response = requests.get(url, headers=headers)
-
-        if response.status_code == 200:
-            products = response.json().get('products', [])
-            if products:
-                product_id = products[0]['id']
-                variants_url = f"{BASE_URL}/products/{product_id}/variants.json"
-                variants_response = requests.get(variants_url, headers=headers)
-
-                if variants_response.status_code == 200:
-                    variants = variants_response.json().get('variants', [])
-                    requested_variant = variant_data["variant"]
-                    existing_variant = next(
-                        (v for v in variants if variant_matches_options(v, requested_variant)),
-                        None,
-                    )
-                    if existing_variant:
-                        variant_id = existing_variant['id']
-                        print(f"Existing variant found with ID {variant_id}. Updating variant.")
-                        (
-                            success,
-                            updated_variant_id,
-                            response_status,
-                            response_payload,
-                        ) = update_or_create_variant(product_id, variant_id, variant_data)
-
-                        if success and updated_variant_id:
-                            if isinstance(response_payload, dict):
-                                variant_response = response_payload.get("variant", {}) or {}
-                                requested_image_id = variant_data["variant"].get("image_id")
-                                requested_media_id = variant_data["variant"].get("media_id")
-                                response_image_id = variant_response.get("image_id")
-
-                                if (
-                                    (requested_image_id or requested_media_id)
-                                    and not response_image_id
-                                ):
-                                    print(
-                                        f"Warning: Shopify did not return an image_id for variant {updated_variant_id} "
-                                        f"after requesting image assignment (image_id={requested_image_id}, "
-                                        f"media_id={requested_media_id})."
-                                    )
-
-                            return updated_variant_id  # Return the ID of the updated variant
-
-                        failure_details = []
-                        if response_status:
-                            failure_details.append(f"status {response_status}")
-
-                        if isinstance(response_payload, dict):
-                            if response_payload.get("errors"):
-                                failure_details.append(f"errors: {response_payload.get('errors')}")
-                            elif response_payload.get("raw"):
-                                failure_details.append(f"response: {response_payload.get('raw')}")
-                        elif response_payload:
-                            failure_details.append(f"response: {response_payload}")
-
-                        requested_image_id = variant_data["variant"].get("image_id")
-                        requested_media_id = variant_data["variant"].get("media_id")
-                        if requested_image_id or requested_media_id:
-                            failure_details.append(
-                                "requested "
-                                f"image_id={requested_image_id} media_id={requested_media_id}"
-                            )
-
-                        detail_message = "; ".join(detail for detail in failure_details if detail)
-                        print(
-                            f"Variant update failed for handle '{handle}' (variant ID {variant_id}). "
-                            + (detail_message if detail_message else "Check the response details above.")
-                        )
-                        return None
-                    else:
-                        default_variant = next(
-                            (v for v in variants if is_default_shopify_variant(v)),
-                            None,
-                        )
-                        if len(variants) == 1 and default_variant:
-                            default_variant_id = default_variant.get("id")
-                            print(
-                                "Replacing Shopify's default variant with the spreadsheet variant "
-                                f"using ID {default_variant_id}."
-                            )
-                            success, new_variant_id, _, _ = update_or_create_variant(
-                                product_id,
-                                default_variant_id,
-                                variant_data,
-                            )
-                            return new_variant_id if success else None
-
-                        print("No matching variant found. Creating a new variant.")
-                        new_variant_id = create_new_variant(product_id, variant_data)
-                        if new_variant_id:
-                            print(f"New variant created with ID {new_variant_id}.")
-                        return new_variant_id  # Return the ID of the newly created variant
-                else:
-                    print(f"Failed to fetch variants for product ID {product_id}: {variants_response.status_code}, {variants_response.text}")
-            else:
-                print(f"Product with handle '{handle}' not found. Cannot create variant.")
-        else:
+        if response.status_code != 200:
             print(f"Failed to fetch product by handle '{handle}': {response.status_code}, {response.text}")
+            return None
 
-        return None  # Return None if no variant ID could be retrieved or created
+        products = response.json().get('products', [])
+        if not products:
+            print(f"Product with handle '{handle}' not found. Cannot create variant.")
+            return None
+
+        return update_or_create_variant_for_product(
+            products[0]['id'],
+            variant_data,
+            identifier=handle,
+        )
 
 
 
@@ -4065,21 +4105,49 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             handle_value = re.sub(r"[^a-z0-9-]", "", handle_value)
             return handle_value or None
 
-        variant_combinations_by_handle = {}
+        variant_combinations_by_product = {}
+        option_values_by_product = {}
         counted_handle = None
         for _, candidate_row in df.iterrows():
             candidate_handle = normalize_handle_value(candidate_row.get("Handle"))
             if candidate_handle:
                 counted_handle = candidate_handle
+            candidate_product_id = normalize_sku_value(candidate_row.get("ID"))
+            candidate_sku = normalize_sku_value(candidate_row.get("Variant SKU"))
             if counted_handle:
-                option_signature = tuple(
-                    normalize_option_value(candidate_row.get(f"Option{option_index} Value"))
-                    for option_index in range(1, 4)
+                product_key = ("handle", counted_handle)
+            elif candidate_product_id:
+                product_key = ("id", candidate_product_id)
+            elif candidate_sku:
+                product_key = ("sku", candidate_sku)
+            else:
+                continue
+
+            option_signature = tuple(
+                normalize_option_value(candidate_row.get(f"Option{option_index} Value"))
+                for option_index in range(1, 4)
+            )
+            if any(option_signature):
+                variant_combinations_by_product.setdefault(product_key, set()).add(
+                    option_signature
                 )
-                if any(option_signature):
-                    variant_combinations_by_handle.setdefault(counted_handle, set()).add(
-                        option_signature
-                    )
+
+            product_option_values = option_values_by_product.setdefault(product_key, {})
+            for option_index in range(1, 4):
+                option_name = normalize_option_value(
+                    candidate_row.get(f"Option{option_index} Name")
+                )
+                option_value = normalize_option_value(
+                    candidate_row.get(f"Option{option_index} Value")
+                )
+                if not option_name:
+                    continue
+                option_entry = product_option_values.setdefault(
+                    option_index,
+                    {"name": option_name, "values": []},
+                )
+                if option_value and option_value not in option_entry["values"]:
+                    option_entry["values"].append(option_value)
 
 
 
@@ -4736,7 +4804,7 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             product_id = row.get('ID')
             variant_id = row.get('Variant ID')
             handle = row.get('Handle')  # Retrieve the handle from the spreadsheet
-            sku = row.get('Variant SKU')  # Retrieve the handle from the spreadsheet
+            sku = normalize_sku_value(row.get('Variant SKU'))
 
             print(f"Processing Product: Title='{sku}', Handle='{handle}'")
 
@@ -4786,32 +4854,39 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 print(f"Skipping row {index} due to missing handle and SKU.")
                 continue
 
-        
+            if handle:
+                product_key = ("handle", handle)
+            elif product_id:
+                product_key = ("id", product_id)
+            else:
+                product_key = ("sku", sku)
+            product_label = handle or sku or product_id
+
             product_options = []
-            if pd.notna(handle):  # Only aggregate options for rows with a Handle
-                seen_option_names = set()
-                for i in range(1, 4):  # Assuming a maximum of 3 options (Option1, Option2, Option3)
-                    option_name = normalize_option_value(row.get(f"Option{i} Name"))
-                    if option_name:
-                        normalized_option_name = option_name.casefold()
-                        if normalized_option_name in seen_option_names:
-                            continue
-                        seen_option_names.add(normalized_option_name)
-                        # Aggregate all unique values for this option across rows with the same Handle
-                        option_values = []
-                        current_option_value = normalize_option_value(row.get(f"Option{i} Value"))
-                        if current_option_value:
-                            option_values.append(current_option_value)
-                        for candidate_value in df.loc[df['Handle'] == handle, f"Option{i} Value"].tolist():
-                            normalized_value = normalize_option_value(candidate_value)
-                            if normalized_value and normalized_value not in option_values:
-                                option_values.append(normalized_value)
-                        if not option_values and i == 1:
-                            option_values = ["Default Title"]
-                        product_options.append({
-                            "name": option_name,
-                            "values": option_values
-                        })
+            seen_option_names = set()
+            grouped_options = option_values_by_product.get(product_key, {})
+            for i in range(1, 4):
+                grouped_option = grouped_options.get(i, {})
+                option_name = (
+                    normalize_option_value(row.get(f"Option{i} Name"))
+                    or grouped_option.get("name")
+                )
+                if not option_name:
+                    continue
+                normalized_option_name = option_name.casefold()
+                if normalized_option_name in seen_option_names:
+                    continue
+                seen_option_names.add(normalized_option_name)
+                option_values = list(grouped_option.get("values", []))
+                current_option_value = normalize_option_value(row.get(f"Option{i} Value"))
+                if current_option_value and current_option_value not in option_values:
+                    option_values.append(current_option_value)
+                if not option_values and i == 1:
+                    option_values = ["Default Title"]
+                product_options.append({
+                    "name": option_name,
+                    "values": option_values
+                })
 
             first_option_values = product_options[0].get("values", []) if product_options else []
             has_custom_option = any(
@@ -4819,8 +4894,7 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 for option_value in first_option_values
             )
             use_temporary_variant = (
-                bool(handle)
-                and len(variant_combinations_by_handle.get(handle, set())) == 1
+                len(variant_combinations_by_product.get(product_key, set())) == 1
                 and bool(product_options)
                 and has_custom_option
             )
@@ -4858,8 +4932,8 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                     if normalized_option_value is not None:
                         variant_payload[f"option{i}"] = normalized_option_value
 
-                if has_cell_value(row.get('Variant SKU')):
-                    variant_payload["sku"] = row.get('Variant SKU')
+                if sku:
+                    variant_payload["sku"] = sku
 
                 if has_cell_value(row.get("Variant Barcode")):
                     variant_payload["barcode"] = str(row.get("Variant Barcode")).split(".")[0]
@@ -4876,7 +4950,7 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                         product_options[0]["values"].append(TEMPORARY_VARIANT_OPTION_VALUE)
                     product_variants.append(build_temporary_variant(variant_payload))
                     print(
-                        f"Adding a temporary second variant for single-variant product '{handle}'."
+                        f"Adding a temporary second variant for single-variant product '{product_label}'."
                     )
 
                 product_payload = {
@@ -5089,8 +5163,8 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 if image_id:
                     variant_data["variant"]["image_id"] = image_id
 
-                if has_cell_value(row.get('Variant SKU')):
-                    variant_data["variant"]["sku"] = row['Variant SKU']
+                if sku:
+                    variant_data["variant"]["sku"] = sku
 
                 if has_cell_value(row.get('Variant Barcode')):
                     variant_data["variant"]["barcode"] = (
@@ -5118,9 +5192,16 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
 
 
 
-            print(f"Updating or creating variant for handle '{handle}':")
+            print(f"Updating or creating variant for product '{product_label}':")
             time.sleep(1)  # Delay for half a second before retrying
-            variant_id = update_or_create_variant_by_handle(handle, variant_data)
+            if product_id:
+                variant_id = update_or_create_variant_for_product(
+                    product_id,
+                    variant_data,
+                    identifier=product_label,
+                )
+            else:
+                variant_id = update_or_create_variant_by_handle(handle, variant_data)
 
             if variant_id:
                 set_dataframe_cell(df, index, 'Variant ID', int(variant_id))
@@ -5129,11 +5210,11 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
 
                                 # If we resolved a GraphQL media GID for the variant’s image, append it to the variant
                 if media_id:
-                    pid = get_product_id_by_handle(handle)
+                    pid = product_id or get_product_id_by_handle(handle)
                     if pid:
                         append_media_to_variant(pid, variant_id, media_id)
                     else:
-                        print(f"⚠️ Could not resolve product_id for handle '{handle}' to append media.")
+                        print(f"⚠️ Could not resolve product_id for '{product_label}' to append media.")
 
 
                 # Handle market-specific pricing dynamically
@@ -5175,16 +5256,16 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                     if variant_metafields_succeeded:
                         if delete_temporary_variants(cleanup_product_id, variant_id):
                             print(
-                                f"Temporary variant cleanup completed for product '{handle}'."
+                                f"Temporary variant cleanup completed for product '{product_label}'."
                             )
                     else:
                         print(
-                            f"Keeping the temporary variant for product '{handle}' because "
+                            f"Keeping the temporary variant for product '{product_label}' because "
                             "one or more real-variant metafields failed to save."
                         )
 
             else:
-                print(f"Failed to process variant for handle '{handle}'.")
+                print(f"Failed to process variant for product '{product_label}'.")
 
 
 
