@@ -233,6 +233,70 @@ def set_dataframe_cell(df, row_index, column, value):
         df[column] = df[column].astype(object)
         df.at[row_index, column] = value
 
+
+def normalize_variant_option(value):
+    """Return a stable string for comparing Shopify variant option values."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        value = value.strip()
+        return value if value else None
+    return str(value)
+
+
+def variant_matches_options(variant, requested_variant):
+    """Match a Shopify variant against the option values supplied by one row."""
+    for option_index in range(1, 4):
+        option_key = f"option{option_index}"
+        requested_value = normalize_variant_option(requested_variant.get(option_key))
+        current_value = normalize_variant_option(variant.get(option_key))
+
+        if requested_value is not None and current_value != requested_value:
+            return False
+        if option_index == 1 and requested_value is None:
+            return current_value in (None, "Default Title")
+
+    return True
+
+
+def is_default_shopify_variant(variant):
+    """Return whether this is Shopify's automatic placeholder variant."""
+    return (
+        normalize_variant_option(variant.get("title")) == "Default Title"
+        or (
+            normalize_variant_option(variant.get("option1")) == "Default Title"
+            and normalize_variant_option(variant.get("option2")) is None
+            and normalize_variant_option(variant.get("option3")) is None
+        )
+    )
+
+
+def prepare_variant_create_data(updated_data, product_id):
+    """Build a REST variant-create body without update-only or fake options."""
+    variant = dict((updated_data or {}).get("variant") or {})
+    inventory_qty = variant.pop("inventory_quantity", None)
+    variant.pop("id", None)
+
+    for option_index in range(1, 4):
+        option_key = f"option{option_index}"
+        option_value = normalize_variant_option(variant.get(option_key))
+        if option_value is None:
+            variant.pop(option_key, None)
+        else:
+            variant[option_key] = option_value
+
+    if not any(option_key in variant for option_key in ("option1", "option2", "option3")):
+        variant["option1"] = "Default Title"
+
+    variant = {key: value for key, value in variant.items() if value is not None}
+    variant["product_id"] = product_id
+    return {"variant": variant}, inventory_qty
+
 # Function to convert HTML to Shopify JSON
 def html_to_shopify_json(html_input):
     # Parse the HTML input using BeautifulSoup
@@ -2485,12 +2549,9 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 print(f"Product with handle '{handle}' found. Updating product.")
                 product_id = products[0]['id']  # Capture the product ID
 
-                # Grab the first variant’s ID if it exists
-                variants = updated_data.get("variants", [])
-                if variants:
-                    variant_id = variants[0].get("id")
-                else:
-                    variant_id = None
+                requested_variants = updated_data.get("product", {}).get("variants", [])
+                requested_variant = requested_variants[0] if requested_variants else {}
+                variant_id = requested_variant.get("id")
 
                 url_update = f"{BASE_URL}/products/{products[0]['id']}.json"
                 updated_data["product"]["handle"] = handle  # Ensure handle is included
@@ -2499,6 +2560,18 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 updated_data = clean_data(updated_data)
                 response_update = requests.put(url_update, headers=headers, json=updated_data)
                 if response_update.status_code == 200:
+                    response_product = response_update.json().get("product", {})
+                    response_variants = response_product.get("variants", [])
+                    matching_variant = next(
+                        (
+                            candidate
+                            for candidate in response_variants
+                            if variant_matches_options(candidate, requested_variant)
+                        ),
+                        None,
+                    )
+                    if matching_variant:
+                        variant_id = matching_variant.get("id")
                     print(f"Successfully updated product with handle '{handle}' and ID {product_id}.")
                     if variant_id:
                         print(f"First variant ID: {variant_id}")
@@ -2690,6 +2763,7 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             url = f"{BASE_URL}/variants/{variant_id}.json"
             cleaned_data = clean_data(updated_data)
             cleaned_data["variant"].pop('inventory_quantity', None)
+            cleaned_data["variant"]["id"] = variant_id
 
             try:
                 response = requests.put(url, headers=headers, json=cleaned_data)
@@ -2754,29 +2828,11 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
 
                 if variants_response.status_code == 200:
                     variants = variants_response.json().get('variants', [])
-
-                    def normalize_option(value):
-                        if value is None:
-                            return None
-                        if isinstance(value, str):
-                            value = value.strip()
-                            return value if value else None
-                        return str(value)
-
-                    target_option1 = normalize_option(variant_data["variant"].get("option1"))
-                    target_option2 = normalize_option(variant_data["variant"].get("option2"))
-                    target_option3 = normalize_option(variant_data["variant"].get("option3"))
-
-                    def is_matching_variant(variant):
-                        if normalize_option(variant.get("option1")) != target_option1:
-                            return False
-                        if target_option2 is not None and normalize_option(variant.get("option2")) != target_option2:
-                            return False
-                        if target_option3 is not None and normalize_option(variant.get("option3")) != target_option3:
-                            return False
-                        return True
-
-                    existing_variant = next((v for v in variants if is_matching_variant(v)), None)
+                    requested_variant = variant_data["variant"]
+                    existing_variant = next(
+                        (v for v in variants if variant_matches_options(v, requested_variant)),
+                        None,
+                    )
                     if existing_variant:
                         variant_id = existing_variant['id']
                         print(f"Existing variant found with ID {variant_id}. Updating variant.")
@@ -2833,6 +2889,23 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                         )
                         return None
                     else:
+                        default_variant = next(
+                            (v for v in variants if is_default_shopify_variant(v)),
+                            None,
+                        )
+                        if len(variants) == 1 and default_variant:
+                            default_variant_id = default_variant.get("id")
+                            print(
+                                "Replacing Shopify's default variant with the spreadsheet variant "
+                                f"using ID {default_variant_id}."
+                            )
+                            success, new_variant_id, _, _ = update_or_create_variant(
+                                product_id,
+                                default_variant_id,
+                                variant_data,
+                            )
+                            return new_variant_id if success else None
+
                         print("No matching variant found. Creating a new variant.")
                         new_variant_id = create_new_variant(product_id, variant_data)
                         if new_variant_id:
@@ -2852,19 +2925,9 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
     def create_new_variant(product_id, updated_data):
         url = f"{BASE_URL}/products/{product_id}/variants.json"
 
-        # Ensure required fields are present
-        required_options = {
-            "option1": updated_data["variant"].get("option1", "Default Option1"),
-            "option2": updated_data["variant"].get("option2", "Default Option2"),
-            "option3": updated_data["variant"].get("option3", "")
-        }
-        updated_data["variant"].update(required_options)
-
-        inventory_qty = updated_data["variant"].get("inventory_quantity") if isinstance(updated_data, dict) else None
-
         # Clean the data to remove NaN or unsupported values
         cleaned_data = clean_data(updated_data)
-        cleaned_data["variant"]["product_id"] = product_id  # Explicitly link to product
+        cleaned_data, inventory_qty = prepare_variant_create_data(cleaned_data, product_id)
 
         response = requests.post(url, headers=headers, json=cleaned_data)
         if response.status_code in [200, 201]:
@@ -4574,6 +4637,9 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                         seen_option_names.add(normalized_option_name)
                         # Aggregate all unique values for this option across rows with the same Handle
                         option_values = []
+                        current_option_value = normalize_option_value(row.get(f"Option{i} Value"))
+                        if current_option_value:
+                            option_values.append(current_option_value)
                         for candidate_value in df.loc[df['Handle'] == handle, f"Option{i} Value"].tolist():
                             normalized_value = normalize_option_value(candidate_value)
                             if normalized_value and normalized_value not in option_values:
@@ -4604,12 +4670,14 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             # Prepare the product update data if the Product ID is available
             if has_cell_value(row.get('Title')):
                 variant_payload = {
-                    "id": variant_id,
                     "price": row['Variant Price'],
                     "inventory_policy": "continue" if not has_cell_value(row.get("Variant Inventory Qty")) else "deny",
                     "inventory_quantity": int(row["Variant Inventory Qty"]) if has_cell_value(row.get("Variant Inventory Qty")) else None,
                     "inventory_management": "shopify" if has_cell_value(row.get("Variant Inventory Qty")) else None
                 }
+
+                if variant_id:
+                    variant_payload["id"] = variant_id
 
                 for i in range(1, 4):
                     normalized_option_value = normalize_option_value(row.get(f'Option{i} Value'))
@@ -4628,14 +4696,14 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
                 if has_cell_value(row.get('Variant Weight Unit')):
                     variant_payload["weight_unit"] = row.get('Variant Weight Unit')
 
-                product_data = {
-                    "product": {
-                        "id": product_id,
-                        "title": row['Title'],
-                        "options": product_options or [{"name": "Title", "values": ["Default Title"]}],
-                        "variants": [variant_payload]
-                    }
+                product_payload = {
+                    "title": row['Title'],
+                    "options": product_options or [{"name": "Title", "values": ["Default Title"]}],
+                    "variants": [variant_payload]
                 }
+                if product_id:
+                    product_payload["id"] = product_id
+                product_data = {"product": product_payload}
 
                 # Add optional fields only if they exist or have valid values
                 if has_cell_value(row.get('Body HTML')):
@@ -4752,9 +4820,11 @@ def run_uploader_logic(file_path=None, shopify_context=None, script_dir=None):
             # Prepare the variant update data if there is a variant
             if variant_name:
                 variant_payload = {
-                    "id": variant_id,
                     "price": row['Variant Price'],
                 }
+
+                if variant_id:
+                    variant_payload["id"] = variant_id
 
                 for i in range(1, 4):
                     normalized_variant_option = normalize_option_value(row.get(f'Option{i} Value'))
